@@ -1,0 +1,5 @@
+venv/
+eye_tracker_venv/
+__pycache__/
+*.pyc
+.matplotlib/

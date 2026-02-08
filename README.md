@@ -25,6 +25,17 @@ A terminal-based eye tracking application that accesses both front and back came
 pip install -r requirements.txt
 ```
 
+### Windows: One-time environment setup
+
+A dedicated virtual environment is set up in `eye_tracker_venv` with all dependencies installed. To use it:
+
+- **Option A — Double-click:** Run `run_eye_tracker_win.bat` to start the Windows eye tracker (it uses the venv automatically).
+- **Option B — Terminal:** From the `Eye-Tracking-` folder run:
+  ```bat
+  eye_tracker_venv\Scripts\activate
+  python eye_tracker_win.py
+  ```
+
 ## Usage
 
 Run the application from the terminal:
