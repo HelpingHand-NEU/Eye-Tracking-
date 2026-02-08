@@ -1,5 +1,6 @@
-from eye_tracker_win import EyeTracker, UsbCameraDetector
-from calibration_win import Calibration
+#!/usr/bin/env python3
+from eye_tracker import EyeTracker, UsbCameraDetector
+from calibration import Calibration
 
 if __name__ == "__main__":
     usb_cam = UsbCameraDetector()
@@ -13,7 +14,6 @@ if __name__ == "__main__":
         calib = Calibration()
         calib.calibrate(tracker)
         tracker.reset = False
-        # After calibration, always show the eye-controlled dot (green dot follows your eyes)
         if calib.calibrated:
             try:
                 calib.run_eye_control(tracker)
