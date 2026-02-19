@@ -45,9 +45,12 @@ DEAD_ZONE_MAX = 0.04   # max movement threshold in normalized gaze; larger = sti
 DEAD_ZONE_MIN = 0.008  # min to avoid jitter
 CURSOR_SMOOTH = 0.25   # 0=instant, 1=no move; lower = faster follow (0.25 = responsive)
 CURSOR_RADIUS = 20
-CALIBRATE_TXT = "calibrate.txt"  # export path for calibration data
-DEBUG_OUTPUT_FILE = "eye_control_debug.txt"  # runtime gx, gy, mapped for first N frames
-DIAGNOSIS_OUTPUT_FILE = "eye_control_diagnosis.txt"  # valid count, map_matrix, first ~20 debug lines
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(PROJECT_ROOT, "eye_tracker", "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+CALIBRATE_TXT = os.path.join(LOG_DIR, "calibrate.txt")  # export path for calibration data
+DEBUG_OUTPUT_FILE = os.path.join(LOG_DIR, "eye_control_debug.txt")  # runtime gx, gy, mapped for first N frames
+DIAGNOSIS_OUTPUT_FILE = os.path.join(LOG_DIR, "eye_control_diagnosis.txt")  # valid count, map_matrix, first ~20 debug lines
 DEBUG_LINES_FOR_DIAGNOSIS = 20
 MAX_JUMP = 0.06  # normalized; reject frame if gaze jump > this (outlier rejection)
 MEDIAN_FILTER_LEN = 5  # number of frames for median filter on gaze

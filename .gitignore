@@ -1,5 +1,12 @@
 venv/
+.venv/
 eye_tracker_venv/
 __pycache__/
 *.pyc
 .matplotlib/
+.DS_Store
+*.npz
+eye_gaze_raw_log.txt
+eye_weights_debug.txt
+yolov8*.pt
+eyetracking_ml/

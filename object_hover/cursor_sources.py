@@ -1,12 +1,1 @@
-import pyautogui
-
-
-class CursorSource:
-    def get_xy(self):
-        raise NotImplementedError
-
-
-class MouseCursor(CursorSource):
-    def get_xy(self):
-        x, y = pyautogui.position()
-        return int(x), int(y)
+from eye_tracker.object_hover.cursor_sources import *  # noqa: F401,F403
