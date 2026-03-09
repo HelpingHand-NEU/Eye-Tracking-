@@ -1,13 +1,10 @@
-import os
 from .webcam_training import EyeTrackingTraining, EyeTrackingTrainingConfig
 
 
 def main():
-    default_image = "/Users/peterwang/Library/CloudStorage/OneDrive-Personal/文档/Capstone/Table3.jpg"
-    image_path = default_image if os.path.exists(default_image) else None
     cfg = EyeTrackingTrainingConfig(
         screen_size=None,
-        image_path=image_path,
+        image_path=None,
         training_data_name="peter",
         fullscreen=True,
         training_mode="webcam",

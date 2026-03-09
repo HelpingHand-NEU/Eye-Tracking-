@@ -4,7 +4,11 @@ detect(frame) -> list of {"bbox": (x, y, w, h), "score": float, "label": str}
 """
 import cv2
 import numpy as np
-from pupil_apriltags import Detector
+try:
+    from pupil_apriltags import Detector
+except Exception as exc:
+    Detector = None
+    _APRILTAG_IMPORT_ERROR = exc
 
 
 class AprilTagDetector:
@@ -15,6 +19,11 @@ class AprilTagDetector:
     """
 
     def __init__(self, families="tag36h11", quad_decimate=1.0, quad_sigma=0.0, refine_edges=True, **kwargs):
+        if Detector is None:
+            raise ImportError(
+                "pupil-apriltags is not available. Install dependencies for AprilTag mode "
+                "(e.g. `pip install pupil-apriltags`)."
+            ) from _APRILTAG_IMPORT_ERROR
         self.detector = Detector(
             families=families,
             nthreads=1,

@@ -3,10 +3,15 @@ import cv2
 import numpy as np
 import time
 from collections import deque
-import mediapipe as mp
+try:
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision as mp_vision
+except Exception:
+    mp = None
+    mp_python = None
+    mp_vision = None
 from eye_tracker.calibration import HEAD_YAW_CLIP, HEAD_PITCH_CLIP, HEAD_ROLL_CLIP
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision as mp_vision
 
 LEFT_EYE_OUTER = 263
 LEFT_EYE_INNER = 362
@@ -59,6 +64,98 @@ EAR_CALIBRATION_SECONDS = 2.0
 DISPLAY_HEIGHT_BASE = 350
 DISPLAY_HEIGHT_MAX = 600
 
+# Glass-frame pupil tracking tuning
+GLASS_ROI_Y0 = 0.12
+GLASS_ROI_Y1 = 0.88
+GLASS_MIN_PUPIL_AREA = 20.0
+GLASS_MAX_PUPIL_AREA_FRAC = 0.25
+GLASS_LOCAL_SEARCH_RADIUS = 70
+GLASS_RAY_COUNT = 24
+GLASS_RAY_STEP = 2
+GLASS_EDGE_GRAD_THRESH = 7.0
+GLASS_EDGE_MIN_BRIGHT = 45.0
+GLASS_QUALITY_PRESETS = {
+    "fast": {
+        "local_search_radius": 52,
+        "ray_count": 16,
+        "ray_step": 3,
+        "edge_grad_thresh": 8.5,
+        "edge_min_bright": 52.0,
+        "clahe_clip": 1.8,
+        "blur_ksize": 5,
+        "kalman_process_noise": 2.2e-2,
+        "kalman_base_measurement_noise": 8.5,
+    },
+    "balanced": {
+        "local_search_radius": GLASS_LOCAL_SEARCH_RADIUS,
+        "ray_count": GLASS_RAY_COUNT,
+        "ray_step": GLASS_RAY_STEP,
+        "edge_grad_thresh": GLASS_EDGE_GRAD_THRESH,
+        "edge_min_bright": GLASS_EDGE_MIN_BRIGHT,
+        "clahe_clip": 2.0,
+        "blur_ksize": 7,
+        "kalman_process_noise": 1.0e-2,
+        "kalman_base_measurement_noise": 6.0,
+    },
+    "max_accuracy": {
+        "local_search_radius": 86,
+        "ray_count": 36,
+        "ray_step": 1,
+        "edge_grad_thresh": 5.2,
+        "edge_min_bright": 36.0,
+        "clahe_clip": 2.4,
+        "blur_ksize": 9,
+        "kalman_process_noise": 7.0e-3,
+        "kalman_base_measurement_noise": 4.0,
+    },
+}
+
+
+class _AdaptiveKalman2D:
+    """Constant-velocity 2D Kalman with confidence-adaptive measurement noise."""
+
+    def __init__(self, process_noise=1e-2, base_measurement_noise=6.0):
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.transitionMatrix = np.array(
+            [[1, 0, 1, 0],
+             [0, 1, 0, 1],
+             [0, 0, 1, 0],
+             [0, 0, 0, 1]],
+            dtype=np.float32,
+        )
+        self.kf.measurementMatrix = np.array(
+            [[1, 0, 0, 0],
+             [0, 1, 0, 0]],
+            dtype=np.float32,
+        )
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * float(process_noise)
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 10.0
+        self.base_r = float(base_measurement_noise)
+        self.initialized = False
+
+    def _set_r(self, conf):
+        conf = float(np.clip(conf, 1e-3, 1.0))
+        r = self.base_r / (conf * conf)
+        r = float(np.clip(r, 1.0, 120.0))
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * r
+
+    def update(self, x, y, conf=1.0):
+        if not self.initialized:
+            self.kf.statePost = np.array([[x], [y], [0.0], [0.0]], dtype=np.float32)
+            self.kf.statePre = self.kf.statePost.copy()
+            self.initialized = True
+        self._set_r(conf)
+        self.kf.predict()
+        m = np.array([[float(x)], [float(y)]], dtype=np.float32)
+        est = self.kf.correct(m)
+        return float(est[0, 0]), float(est[1, 0])
+
+    def predict_only(self):
+        if not self.initialized:
+            return None
+        p = self.kf.predict()
+        return float(p[0, 0]), float(p[1, 0])
+
 
 class UsbCameraDetector:
     """
@@ -105,6 +202,8 @@ class _ResultCompat:
 
 class _FaceMeshCompat:
     def __init__(self, model_path, num_faces=1):
+        if mp_vision is None or mp_python is None:
+            raise ImportError("MediaPipe is required for webcam mode but is not installed.")
         options = mp_vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=model_path),
             num_faces=num_faces,
@@ -125,10 +224,17 @@ class _FaceMeshCompat:
 
 
 class EyeTracker:
-    def __init__(self, front_camera_id=0, back_camera_id=1, reset=False, training_mode="webcam"):
+    def __init__(
+        self,
+        front_camera_id=0,
+        back_camera_id=1,
+        reset=False,
+        training_mode="webcam",
+        glass_quality_profile="balanced",
+    ):
         self.training_mode = training_mode
-        if self.training_mode != "webcam":
-            raise ValueError("EyeTracker only supports training_mode='webcam' for now.")
+        if self.training_mode not in ("webcam", "glass_frame"):
+            raise ValueError("EyeTracker training_mode must be 'webcam' or 'glass_frame'.")
         self.front_camera_id = front_camera_id
         self.back_camera_id = back_camera_id
         self.cap = cv2.VideoCapture(self.front_camera_id)
@@ -167,11 +273,43 @@ class EyeTracker:
         self._buf_R = deque(maxlen=12)
         self._pred = None
         self.reset = reset
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(script_dir, "face_landmarker.task")
-        if not os.path.exists(model_path):
-            model_path = os.path.join(os.path.dirname(script_dir), "face_landmarker.task")
-        self.face_mesh = _FaceMeshCompat(model_path=model_path, num_faces=1)
+        if self.training_mode == "webcam":
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            model_path = os.path.join(script_dir, "face_landmarker.task")
+            if not os.path.exists(model_path):
+                model_path = os.path.join(os.path.dirname(script_dir), "face_landmarker.task")
+            self.face_mesh = _FaceMeshCompat(model_path=model_path, num_faces=1)
+        else:
+            # Glass-frame mode: pupil-only tracking (no face landmarks / MediaPipe dependency).
+            self.face_mesh = None
+            self.glass_quality_profile = "balanced"
+            self._apply_glass_quality_profile(glass_quality_profile)
+            self._glass_kf_left = _AdaptiveKalman2D(
+                process_noise=self._glass_kf_process_noise,
+                base_measurement_noise=self._glass_kf_base_measurement_noise,
+            )
+            self._glass_kf_right = _AdaptiveKalman2D(
+                process_noise=self._glass_kf_process_noise,
+                base_measurement_noise=self._glass_kf_base_measurement_noise,
+            )
+
+    def _apply_glass_quality_profile(self, profile_name):
+        key = str(profile_name).strip().lower()
+        if key not in GLASS_QUALITY_PRESETS:
+            allowed = ", ".join(sorted(GLASS_QUALITY_PRESETS.keys()))
+            raise ValueError(f"glass_quality_profile must be one of: {allowed}. Got: {profile_name}")
+        p = GLASS_QUALITY_PRESETS[key]
+        self.glass_quality_profile = key
+        self._glass_local_search_radius = int(p["local_search_radius"])
+        self._glass_ray_count = int(p["ray_count"])
+        self._glass_ray_step = int(p["ray_step"])
+        self._glass_edge_grad_thresh = float(p["edge_grad_thresh"])
+        self._glass_edge_min_bright = float(p["edge_min_bright"])
+        self._glass_clahe_clip = float(p["clahe_clip"])
+        k = int(p["blur_ksize"])
+        self._glass_blur_ksize = k if (k % 2 == 1) else (k + 1)
+        self._glass_kf_process_noise = float(p["kalman_process_noise"])
+        self._glass_kf_base_measurement_noise = float(p["kalman_base_measurement_noise"])
 
     def _fit_to_frame_ratio(self, img, frame_w, frame_h, max_height=400):
         out_h = min(max_height, frame_h)
@@ -240,6 +378,362 @@ class EyeTracker:
         if x > 1.0:
             return 1.0
         return x
+
+    def _suppress_glints(self, gray_roi):
+        """Suppress bright specular highlights (glints) via inpainting."""
+        if gray_roi is None or gray_roi.size == 0:
+            return gray_roi
+        # Dynamic threshold: very bright tail only.
+        p = float(np.percentile(gray_roi, 99.3))
+        thr = int(max(220, min(250, p)))
+        mask = (gray_roi >= thr).astype(np.uint8) * 255
+        if cv2.countNonZero(mask) == 0:
+            return gray_roi
+        return cv2.inpaint(gray_roi, mask, 3, cv2.INPAINT_TELEA)
+
+    def _ellipse_support_score(self, ellipse, points):
+        """Return [0,1] support score: how many points lie near ellipse."""
+        if ellipse is None or points is None or len(points) == 0:
+            return 0.0
+        (cx, cy), (ma, mi), angle = ellipse
+        axes = (max(1, int(ma * 0.5)), max(1, int(mi * 0.5)))
+        poly = cv2.ellipse2Poly((int(cx), int(cy)), axes, int(angle), 0, 360, 6)
+        if poly is None or len(poly) < 6:
+            return 0.0
+        contour = poly.reshape((-1, 1, 2)).astype(np.int32)
+        inliers = 0
+        for p in points:
+            d = abs(float(cv2.pointPolygonTest(contour, (float(p[0]), float(p[1])), True)))
+            if d <= 3.0:
+                inliers += 1
+        return float(inliers / max(1, len(points)))
+
+    def _refine_pupil_center_with_rays(self, gray_blur, seed_xy):
+        """
+        Starburst-like boundary refinement:
+        cast rays from candidate center and collect strongest dark->bright edges,
+        then fit ellipse and use it to refine center.
+        Returns (cx, cy, quality) in ROI coordinates, or None.
+        """
+        if gray_blur is None or gray_blur.size == 0 or seed_xy is None:
+            return None
+        h, w = gray_blur.shape[:2]
+        cx0, cy0 = float(seed_xy[0]), float(seed_xy[1])
+        if cx0 < 1 or cy0 < 1 or cx0 >= (w - 1) or cy0 >= (h - 1):
+            return None
+        max_r = int(max(12, min(w, h) * 0.45))
+        pts = []
+        angles = np.linspace(0.0, 2.0 * np.pi, self._glass_ray_count, endpoint=False)
+        for ang in angles:
+            dx = float(np.cos(ang))
+            dy = float(np.sin(ang))
+            px = int(round(cx0))
+            py = int(round(cy0))
+            prev = float(gray_blur[py, px])
+            best_pt = None
+            best_grad = 0.0
+            s = self._glass_ray_step
+            while s <= max_r:
+                x = int(round(cx0 + dx * s))
+                y = int(round(cy0 + dy * s))
+                if x < 1 or y < 1 or x >= (w - 1) or y >= (h - 1):
+                    break
+                val = float(gray_blur[y, x])
+                grad = val - prev
+                if grad > self._glass_edge_grad_thresh and val > self._glass_edge_min_bright and grad > best_grad:
+                    best_grad = grad
+                    best_pt = (x, y)
+                prev = val
+                s += self._glass_ray_step
+            if best_pt is not None:
+                pts.append(best_pt)
+        if len(pts) < 8:
+            return None
+        cnt = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
+        ellipse = cv2.fitEllipse(cnt)
+        (ecx, ecy), (ma, mi), _ = ellipse
+        a = max(float(ma), float(mi))
+        b = max(1e-6, min(float(ma), float(mi)))
+        aspect = b / a
+        if a < 6.0 or b < 3.0 or aspect < 0.18:
+            return None
+        support = self._ellipse_support_score(ellipse, pts)
+        quality = float(np.clip(0.5 * support + 0.5 * np.clip(aspect / 0.6, 0.0, 1.0), 0.0, 1.0))
+        return float(ecx), float(ecy), quality
+
+    def _detect_pupil_in_roi(self, gray_roi, prior_xy=None, allow_retry=True):
+        """
+        Robust pupil detector for glass-frame mode.
+        Tricks used:
+        - CLAHE contrast normalization
+        - Otsu dark-region threshold
+        - contour scoring by area + circularity
+        Returns (x, y, conf) in ROI coordinates.
+        """
+        if gray_roi is None or gray_roi.size == 0:
+            return None
+        roi_full = gray_roi
+        h, w = roi_full.shape[:2]
+        if h < 8 or w < 8:
+            return None
+
+        # PuReST-style local search around prediction from previous frame.
+        ox = 0
+        oy = 0
+        used_local_search = False
+        if prior_xy is not None:
+            px, py = int(prior_xy[0]), int(prior_xy[1])
+            r = int(max(24, min(self._glass_local_search_radius, min(w, h) // 2)))
+            x0 = max(0, px - r)
+            x1 = min(w, px + r)
+            y0 = max(0, py - r)
+            y1 = min(h, py + r)
+            if (x1 - x0) >= 16 and (y1 - y0) >= 16:
+                used_local_search = True
+                ox, oy = x0, y0
+                roi = roi_full[y0:y1, x0:x1]
+            else:
+                roi = roi_full
+        else:
+            roi = roi_full
+
+        clahe = cv2.createCLAHE(clipLimit=self._glass_clahe_clip, tileGridSize=(8, 8))
+        no_glint = self._suppress_glints(roi)
+        norm = clahe.apply(no_glint)
+        blur = cv2.GaussianBlur(norm, (self._glass_blur_ksize, self._glass_blur_ksize), 0)
+
+        # Dark blobs (pupil) become foreground.
+        _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        kernel = np.ones((3, 3), np.uint8)
+        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        best_score = -1.0
+        rh, rw = roi.shape[:2]
+        max_area = GLASS_MAX_PUPIL_AREA_FRAC * float(rh * rw)
+
+        for c in contours:
+            area = float(cv2.contourArea(c))
+            if area < GLASS_MIN_PUPIL_AREA or area > max_area:
+                continue
+            per = float(cv2.arcLength(c, True))
+            if per <= 1e-6:
+                continue
+            circularity = float(4.0 * np.pi * area / (per * per))
+            if circularity <= 0.15:
+                continue
+            m = cv2.moments(c)
+            if abs(m["m00"]) < 1e-6:
+                continue
+            cx = float(m["m10"] / m["m00"])
+            cy = float(m["m01"] / m["m00"])
+            ecc_pen = 1.0
+            if len(c) >= 5:
+                (_, _), (ma, mi), _ = cv2.fitEllipse(c)
+                a = max(float(ma), float(mi))
+                b = max(1e-6, min(float(ma), float(mi)))
+                ecc = float(np.sqrt(max(0.0, 1.0 - (b * b) / (a * a))))
+                # Prefer less eccentric pupil candidates.
+                ecc_pen = float(np.clip(1.0 - 0.5 * ecc, 0.5, 1.0))
+            # Penalize boundary blobs (eyelid/lashes at borders).
+            border_pen = 1.0
+            if cx < 4 or cx > (rw - 4) or cy < 4 or cy > (rh - 4):
+                border_pen = 0.5
+            score = area * max(0.0, circularity) * border_pen * ecc_pen
+            if score > best_score:
+                best_score = score
+                best = (cx, cy, area, circularity)
+
+        if best is not None:
+            cx, cy, area, circularity = best
+            conf = float(np.clip((circularity / 0.9) * min(1.0, area / 250.0), 0.05, 1.0))
+            refined = self._refine_pupil_center_with_rays(blur, (cx, cy))
+            if refined is not None:
+                rcx, rcy, rq = refined
+                alpha = float(np.clip(0.25 + 0.55 * rq, 0.25, 0.8))
+                cx = (1.0 - alpha) * cx + alpha * rcx
+                cy = (1.0 - alpha) * cy + alpha * rcy
+                conf = float(np.clip(conf * (0.75 + 0.45 * rq), 0.03, 1.0))
+            # If local-search result is weak or near borders, retry full ROI once.
+            if used_local_search and allow_retry:
+                near_border = (cx < 6.0) or (cy < 6.0) or (cx > (rw - 6.0)) or (cy > (rh - 6.0))
+                if conf < 0.55 or near_border:
+                    retry = self._detect_pupil_in_roi(roi_full, prior_xy=None, allow_retry=False)
+                    if retry is not None and retry[2] > conf:
+                        return retry
+            return cx + float(ox), cy + float(oy), conf
+
+        # If local-search failed, fall back to full ROI once to recover from fast motion.
+        if used_local_search and allow_retry:
+            return self._detect_pupil_in_roi(roi_full, prior_xy=None, allow_retry=False)
+
+        # Fallback to darkest-point detector if contour route fails.
+        min_val, _, min_loc, _ = cv2.minMaxLoc(blur)
+        y0 = max(0, min_loc[1] - 6)
+        y1 = min(blur.shape[0], min_loc[1] + 7)
+        x0 = max(0, min_loc[0] - 6)
+        x1 = min(blur.shape[1], min_loc[0] + 7)
+        patch = blur[y0:y1, x0:x1]
+        if patch.size == 0:
+            return None
+        local_mean = float(np.mean(patch))
+        conf = float(np.clip((local_mean - float(min_val)) / 40.0, 0.0, 0.6))
+        return float(min_loc[0] + ox), float(min_loc[1] + oy), conf
+
+    def _split_glass_rois(self, gray):
+        h, w = gray.shape[:2]
+        y0 = int(max(0, min(h - 1, h * GLASS_ROI_Y0)))
+        y1 = int(max(y0 + 1, min(h, h * GLASS_ROI_Y1)))
+        band = gray[y0:y1, :]
+        half = band.shape[1] // 2
+        left_roi = band[:, :half]
+        right_roi = band[:, half:]
+        return left_roi, right_roi, y0, half, band.shape[1], band.shape[0]
+
+    def _kalman_smooth_pupils(self, left_det, right_det):
+        # Adaptive R: higher confidence => stronger correction, lower lag.
+        if left_det is None:
+            l_pred = self._glass_kf_left.predict_only()
+            lx, ly, lconf = (l_pred[0], l_pred[1], 0.2) if l_pred is not None else (None, None, 0.0)
+        else:
+            lx, ly, lconf = left_det
+            lx, ly = self._glass_kf_left.update(lx, ly, conf=lconf)
+        if right_det is None:
+            r_pred = self._glass_kf_right.predict_only()
+            rx, ry, rconf = (r_pred[0], r_pred[1], 0.2) if r_pred is not None else (None, None, 0.0)
+        else:
+            rx, ry, rconf = right_det
+            rx, ry = self._glass_kf_right.update(rx, ry, conf=rconf)
+        return (lx, ly, lconf), (rx, ry, rconf)
+
+    def _process_frame_glass_frame_basic(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            return None, None, True
+        self._frame_index += 1
+        frame = cv2.flip(frame, 1)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        left_roi, right_roi, y0_band, half, _, band_h = self._split_glass_rois(gray)
+        left_prior = self._glass_kf_left.predict_only()
+        right_prior = self._glass_kf_right.predict_only()
+        left_det = self._detect_pupil_in_roi(left_roi, prior_xy=left_prior)
+        right_det = self._detect_pupil_in_roi(right_roi, prior_xy=right_prior)
+        left_kf, right_kf = self._kalman_smooth_pupils(left_det, right_det)
+        lx, ly, lconf = left_kf
+        rx, ry, rconf = right_kf
+        if lx is None and rx is None:
+            return None, None, True
+
+        # Use whichever side is available; if only one is detected, mirror to both.
+        if lx is None:
+            lx, ly, lconf = rx, ry, rconf
+        elif rx is None:
+            rx, ry, rconf = lx, ly, lconf
+
+        # Convert ROI pupil coordinates to normalized eye-local features in [-0.5, 0.5].
+        gxL = (float(lx) / max(1.0, float(half))) - 0.5
+        gyL = (float(ly) / max(1.0, float(band_h))) - 0.5
+        gxR = (float(rx) / max(1.0, float(half))) - 0.5
+        gyR = (float(ry) / max(1.0, float(band_h))) - 0.5
+
+        gx = float(0.5 * (gxL + gxR))
+        gy = float(0.5 * (gyL + gyR))
+        self.left_eye_pupil_x = int(lx)
+        self.left_eye_pupil_y = int(ly + y0_band)
+        self.left_eye_pupil_x_norm = gx
+        self.left_eye_pupil_y_norm = gy
+        self.last_left_gx = gxL
+        self.last_left_gy = gyL
+        self.last_right_gx = gxR
+        self.last_right_gy = gyR
+        self.last_w_left = 0.5
+        self.last_w_right = 0.5
+        self.last_raw_sum = float(lconf + rconf)
+        return gx, gy, False
+
+    def _process_frame_binocular_glass_frame(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            return None, None, None, None, None, 0.0, True
+        self._frame_index += 1
+        frame = cv2.flip(frame, 1)
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        left_roi, right_roi, y0_band, half, _, band_h = self._split_glass_rois(gray)
+        left_prior = self._glass_kf_left.predict_only()
+        right_prior = self._glass_kf_right.predict_only()
+        left_det = self._detect_pupil_in_roi(left_roi, prior_xy=left_prior)
+        right_det = self._detect_pupil_in_roi(right_roi, prior_xy=right_prior)
+        left_kf, right_kf = self._kalman_smooth_pupils(left_det, right_det)
+        lx, ly, lconf = left_kf
+        rx, ry, rconf = right_kf
+        if lx is None and rx is None:
+            return None, None, None, None, None, 0.0, True
+
+        if lx is None:
+            lx, ly, lconf = rx, ry, rconf
+        elif rx is None:
+            rx, ry, rconf = lx, ly, lconf
+
+        gxL = (float(lx) / max(1.0, float(half))) - 0.5
+        gyL = (float(ly) / max(1.0, float(band_h))) - 0.5
+        gxR = (float(rx) / max(1.0, float(half))) - 0.5
+        gyR = (float(ry) / max(1.0, float(band_h))) - 0.5
+        gx = float(0.5 * (gxL + gxR))
+        gy = float(0.5 * (gyL + gyR))
+
+        # Glass-frame mode has no face pose; keep pose-related fields neutral.
+        yaw = 0.0
+        pitch = 0.0
+        iod = float(np.hypot((lx + half) - rx, ly - ry) / max(1.0, float(w)))
+        roll = float(np.degrees(np.arctan2((ry - ly), max(1.0, (rx - lx)))))
+        lid_hL = 0.02
+        lid_hR = 0.02
+        face_w = 1.0
+        face_h = 1.0
+        nose_x = 0.5
+        nose_y = 0.5
+        iod_safe = max(iod, 1e-4)
+        nx = (nose_x - 0.5) / iod_safe
+        ny = (nose_y - 0.5) / iod_safe
+        yaw_c = float(np.clip(yaw, -HEAD_YAW_CLIP, HEAD_YAW_CLIP))
+        pitch_c = float(np.clip(pitch, -HEAD_PITCH_CLIP, HEAD_PITCH_CLIP))
+        roll_c = float(np.clip(roll, -HEAD_ROLL_CLIP, HEAD_ROLL_CLIP))
+
+        self.last_left_gx = gxL
+        self.last_left_gy = gyL
+        self.last_right_gx = gxR
+        self.last_right_gy = gyR
+        self.last_left_eye_w = 0.04
+        self.last_right_eye_w = 0.04
+        self.last_left_lid_h = lid_hL
+        self.last_right_lid_h = lid_hR
+        self.last_face_w = face_w
+        self.last_face_h = face_h
+        self.last_nose_x = nose_x
+        self.last_nose_y = nose_y
+        self.last_w_left = 0.5
+        self.last_w_right = 0.5
+        self.last_raw_sum = float(lconf + rconf)
+        self.last_iod = iod
+        self.last_roll = roll
+        self.last_yaw = yaw
+        self.last_pitch = pitch
+
+        fv = np.array(
+            [
+                gxL, gyL, gxR, gyR,
+                yaw_c, pitch_c, iod_safe, roll_c,
+                lid_hL, lid_hR, face_w, face_h,
+                nx, ny, 0.5, 0.5,
+            ],
+            dtype=np.float64,
+        )
+        conf = float(np.clip(0.5 * (lconf + rconf), 0.0, 1.0))
+        return gx, gy, yaw, pitch, fv, conf, False
 
     def _iris_center(self, lms, iris_idx):
         cx = float(np.mean([lms[i].x for i in iris_idx]))
@@ -475,6 +969,8 @@ class EyeTracker:
             self.ear_closed_thresh = EAR_CLOSED_THRESH
 
     def process_frame(self):
+        if self.training_mode == "glass_frame":
+            return self._process_frame_glass_frame_basic()
         ret, frame = self.cap.read()
         if not ret:
             return None, None, True
@@ -561,6 +1057,8 @@ class EyeTracker:
         Same format as training; do not change without retraining.
         conf in [0..1].
         """
+        if self.training_mode == "glass_frame":
+            return self._process_frame_binocular_glass_frame()
         ret, frame = self.cap.read()
         if not ret:
             return None, None, None, None, None, 0.0, True

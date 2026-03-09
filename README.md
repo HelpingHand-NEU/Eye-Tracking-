@@ -181,7 +181,7 @@ obj = app.get_focused_object()
   - **`tag_id`**: int or None — AprilTag ID (1–10, etc.) if AprilTags, else None
   - **`bbox`**: (x, y, w, h) — in image pixels
   - **`center`**: (cx, cy) — center of the detection
-
+ 
 Use **`tag_id`** for AprilTags or **`label`** for YOLO when sending the target to the robotic arm.
 
 ### Integration pattern
@@ -205,5 +205,24 @@ if focused:
 ## Cameras
 
 In `main.py`: **CAM_WEBCAM** (eye tracking), **CAM_EXTERNAL** (interface feed). Only indices 0 and 1 on some Macs; disconnect iPhone so USB can be 0.
+
+## Jetson Nano Quick Start
+
+1. Install JetPack and verify camera access first (`v4l2-ctl --list-devices`).
+2. Create a venv and install Jetson dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-jetson.txt
+```
+
+3. If YOLO mode fails with torch errors, install Jetson-compatible PyTorch first, then reinstall `ultralytics`.
+4. If MediaPipe is unavailable from pip on your Jetson image, install a Jetson-compatible MediaPipe build (wheel/source), then rerun.
+
+### Linux/Jetson compatibility behavior in this repo
+
+- Detector imports are lazy: missing YOLO/AprilTag packages no longer break unrelated modes.
+- Errors now point to the exact missing package for the selected mode.
 
 

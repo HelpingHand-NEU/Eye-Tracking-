@@ -1,0 +1,10 @@
+# Jetson Nano dependency baseline (Python 3.8/3.10 recommended).
+# Notes:
+# - OpenCV is usually provided by JetPack (do not pip-install opencv-python unless needed).
+# - PyTorch should be installed from NVIDIA/Jetson wheels first.
+# - MediaPipe may require a Jetson-specific wheel or source build.
+
+numpy>=1.24,<2.0
+pupil-apriltags>=1.0.4
+ultralytics>=8.0.0
+mediapipe>=0.10.0

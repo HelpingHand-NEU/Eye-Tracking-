@@ -1,7 +1,5 @@
 import cv2
 from .input_source import CameraSource, ImageSource
-from .yolo_detector import YOLODetector
-from .apriltag_detector import AprilTagDetector
 from .cursor_sources import MouseCursor, WindowMouseCursor, EyeTrackerCursor
 from .hover_selector import HoverSelector
 from .world_projection import WorldProjector
@@ -63,8 +61,10 @@ class HoverApp:
             raise ValueError("source_type must be 'camera' or 'image'")
 
         if config.detector_type == "apriltag":
+            from .apriltag_detector import AprilTagDetector
             self.detector = AprilTagDetector(families=config.apriltag_families)
         else:
+            from .yolo_detector import YOLODetector
             self.detector = YOLODetector(
                 model_path=config.model_path,
                 conf=config.conf,
@@ -78,8 +78,8 @@ class HoverApp:
             self.cursor = MouseCursor()
             self.cursor_space = "screen"
         elif config.cursor_type == "eye_tracking":
-            if config.training_mode != "webcam":
-                raise ValueError("eye_tracking cursor requires training_mode='webcam' for now.")
+            if config.training_mode not in ("webcam", "glass_frame"):
+                raise ValueError("eye_tracking cursor requires training_mode='webcam' or 'glass_frame'.")
             if config.eye_tracker is None or config.calibration is None:
                 raise ValueError("eye_tracker and calibration are required for cursor_type='eye_tracking'")
             self.cursor = EyeTrackerCursor(config.eye_tracker, config.calibration)

@@ -1,11 +1,19 @@
 import os
 import ssl
-import certifi
+try:
+    import certifi
+except Exception:
+    certifi = None
 
-os.environ.setdefault("SSL_CERT_FILE", certifi.where())
-ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
+if certifi is not None:
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
 
-from ultralytics import YOLO
+try:
+    from ultralytics import YOLO
+except Exception as exc:
+    YOLO = None
+    _YOLO_IMPORT_ERROR = exc
 
 
 def _project_root():
@@ -20,6 +28,11 @@ class YOLODetector:
     """
 
     def __init__(self, model_path="yolov8n.pt", conf=0.25, imgsz=None, iou=0.6):
+        if YOLO is None:
+            raise ImportError(
+                "Ultralytics YOLO is not available. Install dependencies for this mode "
+                "(e.g. `pip install ultralytics`) and ensure torch is installed."
+            ) from _YOLO_IMPORT_ERROR
         if model_path is None:
             model_path = "yolov8n.pt"
         if not os.path.isabs(model_path):

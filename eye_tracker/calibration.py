@@ -615,7 +615,16 @@ class Calibration:
         "label_y_norm",
     ]
     # Only used for glass_frame training; not written in webcam CSVs
-    GLASS_FRAME_EXTRA_COLUMNS = ["tag_id", "board_distance_m"]
+    GLASS_FRAME_EXTRA_COLUMNS = [
+        "tag_id",
+        "board_distance_m",
+        "apriltag_length_m",
+        "apriltag_width_m",
+        "tag_cam_x",
+        "tag_cam_y",
+        "tag_bbox_w_px",
+        "tag_bbox_h_px",
+    ]
 
     @property
     def training_columns(self):
@@ -999,8 +1008,6 @@ class Calibration:
         Record (pupil_x/crop_w, pupil_y/crop_h) only when not blinking. Compute mean per dot
         and dead zone from std of fixation samples. Fit gaze -> screen mapping.
         """
-        if self.training_mode != "webcam":
-            raise ValueError("Calibration currently supports training_mode='webcam' only.")
         name = self._show_fullscreen(self.window_name)
         gaze_means = []
         gaze_stds_x = []
