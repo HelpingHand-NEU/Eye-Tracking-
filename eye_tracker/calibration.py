@@ -526,6 +526,44 @@ def _fit_binocular_ridge(feature_vecs, screen_xy, lam=1e-1):
     return mu, std, W
 
 
+def _remove_outliers_mad(feature_vecs, screen_targets, k_mad=2.5):
+    """Remove samples whose target (screen_x_norm, screen_y_norm) is beyond k_mad * MAD from median.
+    Reduces noisy data from fixation drift or mis-labels. Returns (fv_keep, tgt_keep, n_dropped)."""
+    if not feature_vecs or not screen_targets or len(feature_vecs) != len(screen_targets):
+        return feature_vecs, screen_targets, 0
+    F = np.asarray(feature_vecs, dtype=np.float64)
+    Y = np.asarray(screen_targets, dtype=np.float64)
+    med = np.median(Y, axis=0)
+    mad = np.median(np.abs(Y - med), axis=0)
+    mad = np.maximum(mad, 1e-6)
+    keep = np.all(np.abs(Y - med) <= k_mad * mad, axis=1)
+    n_drop = int(np.sum(~keep))
+    if n_drop == 0:
+        return feature_vecs, screen_targets, 0
+    F = F[keep]
+    Y = Y[keep]
+    return [f.tolist() for f in F], [tuple(y) for y in Y], n_drop
+
+
+def _train_val_split(feature_vecs, screen_targets, val_fraction=0.15, seed=42):
+    """Split into train/val. val_fraction in (0,1). Returns (train_fv, train_tgt, val_fv, val_tgt)."""
+    n = len(feature_vecs)
+    if n < 20 or val_fraction <= 0 or val_fraction >= 1:
+        return feature_vecs, screen_targets, [], []
+    rng = np.random.default_rng(seed)
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    n_val = max(1, int(n * val_fraction))
+    n_train = n - n_val
+    train_idx = idx[:n_train]
+    val_idx = idx[n_train:]
+    train_fv = [feature_vecs[i] for i in train_idx]
+    train_tgt = [screen_targets[i] for i in train_idx]
+    val_fv = [feature_vecs[i] for i in val_idx]
+    val_tgt = [screen_targets[i] for i in val_idx]
+    return train_fv, train_tgt, val_fv, val_tgt
+
+
 def _training_row_quality(gx, gy, lid_hL, lid_hR, eye_w, conf=None, iod_std=0.0, roll_std=0.0):
     """Quality score for a training row (higher is better). Used to filter bad samples."""
     q = 1.0
@@ -624,6 +662,17 @@ class Calibration:
         "tag_cam_y",
         "tag_bbox_w_px",
         "tag_bbox_h_px",
+        "tag_center_x",
+        "tag_center_y",
+        "tag_c0_x", "tag_c0_y", "tag_c1_x", "tag_c1_y", "tag_c2_x", "tag_c2_y", "tag_c3_x", "tag_c3_y",
+        "pupil_L_x_norm",
+        "pupil_L_y_norm",
+        "pupil_R_x_norm",
+        "pupil_R_y_norm",
+        "pupil_L_x_full",
+        "pupil_L_y_full",
+        "pupil_R_x_full",
+        "pupil_R_y_full",
     ]
 
     @property
@@ -642,9 +691,12 @@ class Calibration:
         fullscreen=True,
         window_name="calibration",
         training_mode="webcam",
+        roi_signature=None,
     ):
         if training_mode not in ("webcam", "glass_frame"):
             raise ValueError("training_mode must be 'webcam' or 'glass_frame'.")
+        self._roi_signature = roi_signature  # 8-char hex; when set, CSV/npz paths include _roi_<sig>
+        self._training_path_override = None  # when set, use this CSV (and derived npz) for load/save
         if screen_size is None:
             self.screen_w, self.screen_h = _get_screen_size()
         else:
@@ -683,12 +735,34 @@ class Calibration:
         self.training_mode = training_mode
         self.training_data_name = _normalize_training_name(training_data_name, self.training_mode)
         self.training_data_path = self._resolve_training_path(self.training_data_name, training_data_dir)
+        # Expose effective paths for fallback / reuse (see current_training_data_path, current_roi_signature)
         self.fullscreen = bool(fullscreen)
         self.window_name = window_name
         if self.training_data_path is not None:
             os.makedirs(os.path.dirname(self.training_data_path), exist_ok=True)
             self._maybe_rename_unsuffixed()
             self._migrate_training_file()
+
+    @property
+    def current_training_data_path(self):
+        """Path to the CSV file in use (override or default). Exposed for fallback/reuse."""
+        return self._training_path_override if self._training_path_override else self.training_data_path
+
+    @property
+    def current_roi_signature(self):
+        """ROI signature for the current training set (8-char hex), or from override path. None if not ROI-based."""
+        if self._training_path_override:
+            base = os.path.basename(self._training_path_override)
+            if "_roi_" in base and base.endswith(".csv"):
+                sig = base.split("_roi_")[-1].replace(".csv", "").strip()
+                if sig:
+                    return sig
+        return getattr(self, "_roi_signature", None)
+
+    def set_training_override(self, csv_path: str | None):
+        """Use a specific training CSV (and its matching npz) for load/save. Pass None to clear. For fallback/reuse."""
+        self._training_path_override = csv_path
+
     def _migrate_training_file(self):
         if self.training_data_path is None or not os.path.exists(self.training_data_path):
             return
@@ -748,6 +822,8 @@ class Calibration:
     def _resolve_training_path(self, name, base_dir):
         if not name:
             return None
+        if getattr(self, "_roi_signature", None) and getattr(self, "training_mode", None) == "glass_frame":
+            name = f"{name}_roi_{self._roi_signature}"
         suffix = _training_suffix(self.training_mode)
         base_dir_path = base_dir
         if base_dir_path and not os.path.isabs(base_dir_path):
@@ -782,8 +858,18 @@ class Calibration:
                 pass
 
     def _ml_model_path(self):
+        # If override CSV path contains _roi_<sig>, load npz for that ROI set (fallback/reuse)
+        if getattr(self, "_training_path_override", None):
+            base = os.path.basename(self._training_path_override)
+            if "_roi_" in base and base.endswith(".csv"):
+                sig = base.split("_roi_")[-1].replace(".csv", "").strip()
+                if sig:
+                    return os.path.join(PROJECT_ROOT, f"gaze_ml_glassframe_roi_{sig}.npz")
         suffix = _training_suffix(self.training_mode)
         if suffix:
+            roi_sig = getattr(self, "_roi_signature", None)
+            if roi_sig and self.training_mode == "glass_frame":
+                return os.path.join(PROJECT_ROOT, f"gaze_ml_{suffix}_roi_{roi_sig}.npz")
             filename = f"gaze_ml_{suffix}.npz"
             target = os.path.join(PROJECT_ROOT, filename)
             legacy = os.path.join(PROJECT_ROOT, "gaze_ml.npz")
@@ -826,13 +912,14 @@ class Calibration:
             return False
 
     def _load_training_data(self):
-        if self.training_data_path is None or not os.path.exists(self.training_data_path):
+        path = self.current_training_data_path
+        if path is None or not os.path.exists(path):
             return [], []
         feature_vecs = []
         screen_targets = []
         screen_size_checked = False
         try:
-            with open(self.training_data_path, "r", newline="") as f:
+            with open(path, "r", newline="") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     try:
@@ -907,11 +994,14 @@ class Calibration:
         return feature_vecs, screen_targets
 
     def _append_training_rows(self, rows):
-        if self.training_data_path is None or not rows:
+        """Append training rows to the calibration CSV. Only called from calibration/training flow (e.g. GlassFrameTraining), never from the test script or hover app."""
+        path = self.current_training_data_path
+        if path is None or not rows:
             return
         try:
-            file_exists = os.path.exists(self.training_data_path)
-            with open(self.training_data_path, "a", newline="") as f:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            file_exists = os.path.exists(path)
+            with open(path, "a", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=self.training_columns)
                 if not file_exists or f.tell() == 0:
                     writer.writeheader()

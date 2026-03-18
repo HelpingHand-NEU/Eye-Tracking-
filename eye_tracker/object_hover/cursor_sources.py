@@ -44,10 +44,13 @@ class EyeTrackerCursor(CursorSource):
 
     STATS_INTERVAL = 200
 
-    def __init__(self, tracker, calibration):
+    def __init__(self, tracker, calibration, min_cutoff=1.2, beta=0.12, gaze_jump_thresh=0.08):
         self.tracker = tracker
         self.calibration = calibration
-        self._gaze_filter = OneEuroFilter2D(min_cutoff=2.5, beta=0.15, d_cutoff=1.0)
+        # Configurable smoothing: lower min_cutoff = smoother (less jitter), higher beta = less lag
+        self._gaze_filter = OneEuroFilter2D(min_cutoff=float(min_cutoff), beta=float(beta), d_cutoff=1.0)
+        self._last_gaze_before_filter = None  # for jump rejection before OneEuro
+        self._gaze_jump_thresh = float(gaze_jump_thresh)  # reject frame if normalized gaze jumps more than this
         self._log_start = time.perf_counter()
         self._log_file = None
         log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
@@ -113,6 +116,11 @@ class EyeTrackerCursor(CursorSource):
                 self._stats["drop"] += 1
                 self._maybe_print_stats()
                 return None
+            # Reject large jumps (spikes) before smoothing so cursor doesn't jump
+            if self._last_gaze_before_filter is not None:
+                lgx, lgy = self._last_gaze_before_filter
+                if abs(gx - lgx) > self._gaze_jump_thresh or abs(gy - lgy) > self._gaze_jump_thresh:
+                    gx, gy = lgx, lgy
             if conf < 0.2:
                 self._stats["drop"] += 1
                 self._maybe_print_stats()
@@ -127,6 +135,7 @@ class EyeTrackerCursor(CursorSource):
                 self._maybe_print_stats()
                 return None
 
+            gaze_before_filter = (gx, gy)
             now = time.perf_counter()
             gx, gy = self._gaze_filter(gx, gy, t=now)
 
@@ -176,6 +185,7 @@ class EyeTrackerCursor(CursorSource):
                 self._stats["drop"] += 1
                 self._maybe_print_stats()
                 return None
+            self._last_gaze_before_filter = gaze_before_filter
             if used_ml:
                 self._stats["ml"] += 1
             elif used_binoc:

@@ -25,10 +25,15 @@ class HoverAppConfig:
         hover_max_px=80,
         homography=None,
         calibrate=True,
+        csi_sensor_id=None,  # if set, back/interface camera uses CSI (e.g. 0 = cam0 24-pin on Jetson)
+        gaze_smooth_min_cutoff=None,  # OneEuro: lower = smoother, less jitter (e.g. 1.0)
+        gaze_smooth_beta=None,
+        gaze_jump_thresh=None,  # reject gaze jump above this (e.g. 0.06)
     ):
         self.source_type = source_type
         self.image_path = image_path
         self.camera_id = camera_id
+        self.csi_sensor_id = csi_sensor_id
         self.cursor_type = cursor_type
         self.eye_tracker = eye_tracker
         self.calibration = calibration
@@ -43,6 +48,9 @@ class HoverAppConfig:
         self.hover_max_px = hover_max_px
         self.homography = homography
         self.calibrate = bool(calibrate)
+        self.gaze_smooth_min_cutoff = gaze_smooth_min_cutoff
+        self.gaze_smooth_beta = gaze_smooth_beta
+        self.gaze_jump_thresh = gaze_jump_thresh
 
 
 class HoverApp:
@@ -52,7 +60,10 @@ class HoverApp:
         self.screen_w = None
         self.screen_h = None
         if config.source_type == "camera":
-            self.source = CameraSource(camera_id=config.camera_id)
+            self.source = CameraSource(
+                camera_id=config.camera_id,
+                csi_sensor_id=getattr(config, "csi_sensor_id", None),
+            )
         elif config.source_type == "image":
             if not config.image_path:
                 raise ValueError("image_path is required when source_type='image'")
@@ -82,7 +93,14 @@ class HoverApp:
                 raise ValueError("eye_tracking cursor requires training_mode='webcam' or 'glass_frame'.")
             if config.eye_tracker is None or config.calibration is None:
                 raise ValueError("eye_tracker and calibration are required for cursor_type='eye_tracking'")
-            self.cursor = EyeTrackerCursor(config.eye_tracker, config.calibration)
+            kwargs = {}
+            if getattr(config, "gaze_smooth_min_cutoff", None) is not None:
+                kwargs["min_cutoff"] = config.gaze_smooth_min_cutoff
+            if getattr(config, "gaze_smooth_beta", None) is not None:
+                kwargs["beta"] = config.gaze_smooth_beta
+            if getattr(config, "gaze_jump_thresh", None) is not None:
+                kwargs["gaze_jump_thresh"] = config.gaze_jump_thresh
+            self.cursor = EyeTrackerCursor(config.eye_tracker, config.calibration, **kwargs)
             self.cursor_space = "screen"
             self.screen_w = int(config.calibration.screen_w)
             self.screen_h = int(config.calibration.screen_h)

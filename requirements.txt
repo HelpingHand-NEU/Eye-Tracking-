@@ -1,6 +1,12 @@
 opencv-python>=4.8.0
 mediapipe>=0.10.0
-pupil-apriltags>=1.2.0
+pupil-apriltags>=1.0.0
 numpy>=1.24.0
 dlib>=19.24.0
+# Optional but recommended: PuRe pupil detector for much more accurate glass-frame tracking.
+# Install with: pip install pupil-detectors  (may need build tools on some platforms)
+pupil-detectors>=2.0.0
+
+# Optional: for ML gaze refinement in CSI 3D tracker (calibration-based Ridge regression)
+# scikit-learn>=1.0.0
 

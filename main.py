@@ -1,28 +1,61 @@
 #!/usr/bin/env python3
-"""Switch between calibration, object detection (YOLO), and AprilTag detection."""
+"""Switch between calibration, object detection (YOLO), and AprilTag detection.
+
+Run calibration directly from main:
+  python main.py calibrate
+
+When EYE_TRACKING_MODE is "glass_frame", eye tracking uses the JEO 3DTracker (CSI camera
+with left/right ROI crops). Calibration and hover both use JEOGlassFrameTracker.
+
+Optional: calibration_config.json in project root overrides camera IDs, calibration
+params (validation, outliers), and cursor smoothing for reproducibility.
+"""
 import os
 import sys
+import json
 import cv2
 from eye_tracker.calibration import Calibration
 from eye_tracker.eye_tracker import EyeTracker
 from eye_tracker.object_hover.app import HoverApp, HoverAppConfig
 from eye_tracker.glass_frame_training import GlassFrameTraining, GlassFrameTrainingConfig
+from eye_tracker.glass_frame_jeo_tracker import (
+    JEOGlassFrameTracker,
+    jeo_tracker_available,
+    load_rois_and_signature,
+)
 
-# --- Only indices 0 and 1 exist. 1=webcam (eye). For interface use 0=USB (disconnect iPhone so USB is 0). ---
-CAM_WEBCAM = 1
-CAM_EXTERNAL = 0
-# Eye tracking source:
-# - "webcam": face-landmark + iris (MediaPipe)
-# - "glass_frame": pupil-only tracking (no face landmarks)
-EYE_TRACKING_MODE = "glass_frame"
-# Camera used by the eye-tracking source above.
+# --- Camera mapping (Jetson Nano) ---
+# Back camera (AprilTag / scene) = cam0 = 24-pin CSI = sensor-id 0.
+# Eye camera (pupil / 3DTracker) = cam1 = 15-pin CSI = sensor-id 1.
+# Glass-frame uses JEOresearch/EyeTracker 3DTracker (vendor); see CREDITS.md.
+CAM_WEBCAM = 1   # Eye camera index when using USB (non-Jetson)
+CAM_EXTERNAL = 0 # Fallback AprilTag camera (USB) when not using CSI for back
+EYE_TRACKING_MODE = "glass_frame"  # "webcam" | "glass_frame" — glass_frame = CSI + 3DTracker
 EYE_TRACKING_CAMERA_ID = CAM_WEBCAM
-# Outward-facing camera used for AprilTag board/tag capture in glass-frame calibration.
-TAG_CAMERA_ID = CAM_EXTERNAL
-# For glass-frame mode:
+# Back camera: 24-pin CSI (cam0) = sensor 0. None = use TAG_CAMERA_ID as USB.
+TAG_CAMERA_CSI_SENSOR_ID = 0  # cam0 / 24-pin CSI for AprilTag (back) camera
+# Eye camera: 15-pin CSI (cam1) = sensor 1 when back uses cam0.
+GLASS_EYE_SENSOR_ID = 1  # cam1 for pupil/eye (3DTracker); use 0 if only one CSI camera
+TAG_CAMERA_ID = CAM_EXTERNAL  # used only when TAG_CAMERA_CSI_SENSOR_ID is None
 GLASS_CALIBRATION_MODE = "automated_calibration"  # or "manual_calibration"
 APRILTAG_LENGTH_M = 0.04
-GLASS_QUALITY_PROFILE = "max_accuracy"  # fast | balanced | max_accuracy
+GLASS_QUALITY_PROFILE = "max_accuracy"  # kept for config API; glass_frame uses JEO 3DTracker only
+
+
+def _project_root():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def load_calibration_config():
+    """Load calibration_config.json from project root if present. Returns dict or None."""
+    path = os.path.join(_project_root(), "calibration_config.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def run_mode(mode: str):
@@ -39,16 +72,43 @@ def run_mode(mode: str):
     run_hover(detector_type="yolo", interface_camera=True)
 
 
-def run_hover(detector_type="yolo", interface_camera=True, image_path=None, calibrate_first=False):
-    """Run hover app: eye tracking + interface (external camera or image)."""
-    training_mode = EYE_TRACKING_MODE
-    eye_cam = EYE_TRACKING_CAMERA_ID
-    tracker = EyeTracker(
-        front_camera_id=eye_cam,
-        reset=True,
-        training_mode=training_mode,
-        glass_quality_profile=GLASS_QUALITY_PROFILE,
-    )
+def run_hover(detector_type="yolo", interface_camera=True, image_path=None, calibrate_first=False,
+              training_file_override=None, roi_file_override=None):
+    """Run hover app: eye tracking + interface (external camera or image).
+    training_file_override: use this CSV (and its matching npz) for calibration (fallback to previous ROI set).
+    roi_file_override: use this glass_frame_rois.json for tracker ROIs (fallback to previous ROI draw).
+    Env: GLASS_FRAME_TRAINING_FILE, GLASS_FRAME_ROI_FILE for overrides without code change."""
+    cfg_json = load_calibration_config()
+    cam = (cfg_json.get("camera") or {}) if cfg_json else {}
+    training_file_override = training_file_override or os.environ.get("GLASS_FRAME_TRAINING_FILE")
+    roi_file_override = roi_file_override or os.environ.get("GLASS_FRAME_ROI_FILE")
+    training_mode = (cfg_json.get("eye_tracking_mode") or EYE_TRACKING_MODE) if cfg_json else EYE_TRACKING_MODE
+    rois_path = roi_file_override
+    roi_signature = None
+    if training_mode == "glass_frame":
+        if not jeo_tracker_available():
+            print("Glass-frame mode requires JEO 3DTracker. Clone: git clone https://github.com/JEOresearch/EyeTracker.git vendor/EyeTracker")
+            sys.exit(1)
+        _, _path, roi_signature = load_rois_and_signature(roi_file_override)
+        if rois_path is None:
+            rois_path = _path
+        tracker = JEOGlassFrameTracker(
+            eye_camera_id=cam.get("eye_tracking_camera_id", EYE_TRACKING_CAMERA_ID),
+            eye_sensor_id=cam.get("glass_eye_sensor_id", GLASS_EYE_SENSOR_ID),
+            rois_path=rois_path,
+        )
+        if not tracker.is_opened():
+            print("Could not open glass-frame eye camera (CSI or USB). Check GLASS_EYE_SENSOR_ID and EYE_TRACKING_CAMERA_ID.")
+            sys.exit(1)
+    else:
+        tracker = EyeTracker(
+            front_camera_id=EYE_TRACKING_CAMERA_ID,
+            reset=True,
+            training_mode=training_mode,
+            glass_quality_profile=GLASS_QUALITY_PROFILE,
+        )
+    # When using a training file override, we don't need roi_signature for path resolution (override path has sig in name)
+    calib_roi_sig = None if training_file_override else roi_signature
     calibration = Calibration(
         training_data_name="peter",
         training_data_dir="eyetracking_ml",
@@ -56,7 +116,19 @@ def run_hover(detector_type="yolo", interface_camera=True, image_path=None, cali
         fullscreen=True,
         window_name="calibration",
         training_mode=training_mode,
+        roi_signature=calib_roi_sig,
     )
+    if training_file_override:
+        calibration.set_training_override(training_file_override)
+    # Expose which training file and ROI are in use (for fallback/reuse)
+    if training_mode == "glass_frame":
+        print(f"Training data file: {calibration.current_training_data_path}")
+        if calibration.current_roi_signature:
+            print(f"ROI signature: {calibration.current_roi_signature}")
+        if getattr(tracker, "get_roi_info", None):
+            roi_info = tracker.get_roi_info()
+            if roi_info:
+                print(f"ROI (normalized): left={roi_info.get('left_eye_roi')} right={roi_info.get('right_eye_roi')}")
     if calibrate_first:
         if calibration.calibrate(tracker) == "quit":
             cv2.destroyAllWindows()
@@ -69,11 +141,14 @@ def run_hover(detector_type="yolo", interface_camera=True, image_path=None, cali
             sys.exit(1)
 
     if interface_camera:
-        source_type, camera_id, image_path = "camera", CAM_EXTERNAL, None
+        source_type, camera_id, image_path = "camera", cam.get("tag_camera_id", CAM_EXTERNAL), None
     else:
         source_type, camera_id = "image", 0
         if not image_path:
             raise ValueError("image_path required when interface_camera=False")
+
+    csi_sensor_id = (cam.get("tag_camera_csi_sensor_id", TAG_CAMERA_CSI_SENSOR_ID) if (training_mode == "glass_frame" and interface_camera) else None)
+    smooth = (cfg_json.get("cursor_smoothing") or {}) if cfg_json else {}
 
     cfg = HoverAppConfig(
         source_type=source_type,
@@ -90,24 +165,46 @@ def run_hover(detector_type="yolo", interface_camera=True, image_path=None, cali
         hover_max_px=90,
         calibrate=calibrate_first,
         fullscreen=True,
+        csi_sensor_id=csi_sensor_id,
+        gaze_smooth_min_cutoff=smooth.get("min_cutoff"),
+        gaze_smooth_beta=smooth.get("beta"),
+        gaze_jump_thresh=smooth.get("gaze_jump_thresh"),
     )
     HoverApp(cfg).run()
 
 
 def run_calibration():
-    """Run calibration for the currently selected eye-tracking source."""
-    training_mode = EYE_TRACKING_MODE
+    """Run calibration from main. With glass_frame mode uses CSI eye camera + JEO 3DTracker."""
+    cfg_json = load_calibration_config()
+    training_mode = (cfg_json.get("eye_tracking_mode") or EYE_TRACKING_MODE) if cfg_json else EYE_TRACKING_MODE
+    cal = (cfg_json.get("calibration") or {}) if cfg_json else {}
+    cam = (cfg_json.get("camera") or {}) if cfg_json else {}
     if training_mode == "glass_frame":
+        if not jeo_tracker_available():
+            print("Glass-frame calibration requires JEO 3DTracker. Clone: git clone https://github.com/JEOresearch/EyeTracker.git vendor/EyeTracker")
+            sys.exit(1)
+        print("Running glass-frame calibration (CSI eye camera + JEO 3DTracker)...")
+        roi_file = os.environ.get("GLASS_FRAME_ROI_FILE")
         cfg = GlassFrameTrainingConfig(
-            calibration_mode=GLASS_CALIBRATION_MODE,
+            calibration_mode=cal.get("mode") or GLASS_CALIBRATION_MODE,
             training_data_name="peter",
             training_data_dir="eyetracking_ml",
-            eye_camera_id=EYE_TRACKING_CAMERA_ID,
-            tag_camera_id=TAG_CAMERA_ID,
+            eye_camera_id=cam.get("eye_tracking_camera_id", EYE_TRACKING_CAMERA_ID),
+            eye_sensor_id=cam.get("glass_eye_sensor_id", GLASS_EYE_SENSOR_ID),
+            tag_camera_id=cam.get("tag_camera_id", TAG_CAMERA_ID),
+            tag_camera_csi_sensor_id=cam.get("tag_camera_csi_sensor_id", TAG_CAMERA_CSI_SENSOR_ID),
             apriltag_length=APRILTAG_LENGTH_M,
             tag_ids=(1, 2, 3, 4, 5),
+            num_automated_positions=cal.get("num_automated_positions", 9),
             training_mode="glass_frame",
             glass_quality_profile=GLASS_QUALITY_PROFILE,
+            rois_path=roi_file if roi_file else None,
+            validation_fraction=cal.get("validation_fraction", 0.15),
+            outlier_mad_multiplier=cal.get("outlier_mad_multiplier", 2.5),
+            min_train_samples=cal.get("min_train_samples", 10),
+            tag_camera_buffer_drain=cal.get("tag_camera_buffer_drain", 2),
+            overlap_tag_eye_detection=cal.get("overlap_tag_eye_detection", True),
+            tag_quad_decimate=float(cal.get("tag_quad_decimate", 1.0)),
         )
         GlassFrameTraining(cfg).run()
         return

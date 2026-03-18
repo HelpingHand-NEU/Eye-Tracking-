@@ -44,13 +44,16 @@ class AprilTagDetector:
         results = self.detector.detect(gray)
         dets = []
         for r in results:
-            corners = np.array(r.corners, dtype=np.int32)
+            corners = np.array(r.corners, dtype=np.float64)
             x_min = int(corners[:, 0].min())
             y_min = int(corners[:, 1].min())
             x_max = int(corners[:, 0].max())
             y_max = int(corners[:, 1].max())
             w = x_max - x_min
             h = y_max - y_min
+            # Center from corner mean (more stable than bbox center for perspective)
+            center = (float(corners[:, 0].mean()), float(corners[:, 1].mean()))
+            corners_list = [(float(corners[i, 0]), float(corners[i, 1])) for i in range(4)]
             score = float(getattr(r, "decision_margin", 0.0) or 0.0)
             label = f"tag_{r.tag_id}"
             dets.append(
@@ -59,6 +62,8 @@ class AprilTagDetector:
                     "score": score,
                     "label": label,
                     "tag_id": r.tag_id,
+                    "center": center,
+                    "corners": corners_list,
                 }
             )
         return dets

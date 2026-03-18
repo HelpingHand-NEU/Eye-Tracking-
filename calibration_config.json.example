@@ -1,0 +1,25 @@
+{
+  "comment": "Copy to calibration_config.json and edit. Used by main.py and calibration for reproducibility.",
+  "eye_tracking_mode": "glass_frame",
+  "camera": {
+    "tag_camera_csi_sensor_id": 0,
+    "glass_eye_sensor_id": 1,
+    "tag_camera_id": 0,
+    "eye_tracking_camera_id": 1
+  },
+  "calibration": {
+    "mode": "manual_calibration",
+    "num_automated_positions": 9,
+    "validation_fraction": 0.15,
+    "outlier_mad_multiplier": 2.5,
+    "min_train_samples": 10,
+    "tag_camera_buffer_drain": 2,
+    "overlap_tag_eye_detection": true,
+    "tag_quad_decimate": 1.0
+  },
+  "cursor_smoothing": {
+    "min_cutoff": 1.0,
+    "beta": 0.08,
+    "gaze_jump_thresh": 0.06
+  }
+}

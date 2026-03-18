@@ -225,4 +225,30 @@ pip install -r requirements-jetson.txt
 - Detector imports are lazy: missing YOLO/AprilTag packages no longer break unrelated modes.
 - Errors now point to the exact missing package for the selected mode.
 
+---
+
+## Glass-frame (camera on glasses) and ML data
+
+For the **camera mounted on the glass frame** (CSI on Jetson), all eye-tracking and **machine learning data** come from the vendored **JEOresearch/EyeTracker** 3DTracker. We do not use a separate in-tree implementation.
+
+- **Training/calibration:** `glass_frame_training.py` uses `JEOGlassFrameTracker`, which runs the vendor’s `process_frame()` on each frame and reads `gaze_vector.txt` (origin + direction) to build the 16-D feature vector for ML. Run calibration with `python main.py calibrate` (with `EYE_TRACKING_MODE = "glass_frame"`).
+- **Live tracking:** `main.py` and the hover app use `JEOGlassFrameTracker` for glass-frame mode; the same tracker feeds `map_binocular()` for gaze→screen mapping.
+- **Standalone test:** `python test_csi_glass_frame_pupil.py` (default `--sensor-id 0` on Jetson).
+- **ROI (better detection when camera isn’t close):** Run `python calibrate_glass_frame_rois.py [--sensor-id 0]`, press **1** and drag a rectangle around your **left** eye, press **2** and drag around your **right** eye, then **s** to save to `glass_frame_rois.json`. The next time you start the eye tracker (test, calibration, or main app), it will use these cropped regions for the 3D tracker and convert pupil coordinates back to full-frame (glass-frame) coordinates.
+
+- **ROI redraw → new training file:** If you redraw the ROIs, a **new** training CSV (and matching `.npz` model) is created automatically so old data is not mixed with the new crop. Files are named with an ROI signature (e.g. `peter_glassframe_roi_a1b2c3d4.csv` and `gaze_ml_glassframe_roi_a1b2c3d4.npz`). A sidecar `*_roi_meta.json` next to each CSV stores the ROI coordinates and signature for that file.
+
+- **Exposed for fallback/reuse:** You can switch back to a previous ROI set and its training data:
+  - **Calibration:** `calibration.current_training_data_path` (which CSV is in use), `calibration.current_roi_signature` (8-char ROI id), `calibration.set_training_override(csv_path)` to use a specific CSV/npz pair.
+  - **Tracker:** `tracker.get_roi_info(frame_w, frame_h)` returns normalized `left_eye_roi` / `right_eye_roi`, optional pixel rects `left_rect_px` / `right_rect_px`, and `roi_signature`.
+  - **Env / args:** Set `GLASS_FRAME_TRAINING_FILE` or pass `training_file_override` to use an old CSV; set `GLASS_FRAME_ROI_FILE` or pass `roi_file_override` to use an old ROI file. Example: `GLASS_FRAME_TRAINING_FILE=eyetracking_ml/peter_glassframe_roi_abc12345.csv python main.py object_detection`.
+
+See **CREDITS.md** and `vendor/EyeTracker/3DTracker/README_CSI.md`.
+
+## Acknowledgments / Third-party open source
+
+This project uses **someone else's open source repository** for 3D eye tracking on the glass-frame (CSI) camera:
+
+- **[JEOresearch/EyeTracker](https://github.com/JEOresearch/EyeTracker)** — 3DTracker (Orlosky 3D eye tracker). The algorithm (pupil detection, ellipse fitting, ray intersection, 3D gaze vector) is from that repo. We vendor it under `vendor/EyeTracker` and use it for all glass-frame tracking and ML; we do not claim authorship of that code. See `vendor/EyeTracker/LICENSE` and their [3DTracker readme](https://github.com/JEOresearch/EyeTracker/tree/main/3DTracker).
+
 

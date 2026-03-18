@@ -11,6 +11,10 @@ except Exception:
     mp = None
     mp_python = None
     mp_vision = None
+try:
+    from pupil_detectors import Detector2D as PuReDetector2D
+except Exception:
+    PuReDetector2D = None
 from eye_tracker.calibration import HEAD_YAW_CLIP, HEAD_PITCH_CLIP, HEAD_ROLL_CLIP
 
 LEFT_EYE_OUTER = 263
@@ -74,6 +78,9 @@ GLASS_RAY_COUNT = 24
 GLASS_RAY_STEP = 2
 GLASS_EDGE_GRAD_THRESH = 7.0
 GLASS_EDGE_MIN_BRIGHT = 45.0
+# Stability: reject gaze jumps larger than this (normalized); use previous value instead
+GLASS_GAZE_JUMP_THRESH = 0.08
+GLASS_MEDIAN_LEN = 5  # temporal median over this many frames to reduce jitter
 GLASS_QUALITY_PRESETS = {
     "fast": {
         "local_search_radius": 52,
@@ -94,8 +101,8 @@ GLASS_QUALITY_PRESETS = {
         "edge_min_bright": GLASS_EDGE_MIN_BRIGHT,
         "clahe_clip": 2.0,
         "blur_ksize": 7,
-        "kalman_process_noise": 1.0e-2,
-        "kalman_base_measurement_noise": 6.0,
+        "kalman_process_noise": 5.0e-3,
+        "kalman_base_measurement_noise": 9.0,
     },
     "max_accuracy": {
         "local_search_radius": 86,
@@ -105,8 +112,8 @@ GLASS_QUALITY_PRESETS = {
         "edge_min_bright": 36.0,
         "clahe_clip": 2.4,
         "blur_ksize": 9,
-        "kalman_process_noise": 7.0e-3,
-        "kalman_base_measurement_noise": 4.0,
+        "kalman_process_noise": 3.0e-3,
+        "kalman_base_measurement_noise": 12.0,
     },
 }
 
@@ -235,6 +242,11 @@ class EyeTracker:
         self.training_mode = training_mode
         if self.training_mode not in ("webcam", "glass_frame"):
             raise ValueError("EyeTracker training_mode must be 'webcam' or 'glass_frame'.")
+        if self.training_mode == "glass_frame":
+            raise ValueError(
+                "For glass_frame (camera on glasses) use JEOGlassFrameTracker from eye_tracker.glass_frame_jeo_tracker. "
+                "ML data is taken from the JEOresearch/EyeTracker 3DTracker (vendor)."
+            )
         self.front_camera_id = front_camera_id
         self.back_camera_id = back_camera_id
         self.cap = cv2.VideoCapture(self.front_camera_id)
@@ -292,6 +304,10 @@ class EyeTracker:
                 process_noise=self._glass_kf_process_noise,
                 base_measurement_noise=self._glass_kf_base_measurement_noise,
             )
+            self._glass_gaze_buf = deque(maxlen=GLASS_MEDIAN_LEN)
+            self._last_glass_gaze = None
+            # PuRe (Pupil Labs) detector for more accurate pupil detection when available
+            self._pupil_detector_2d = PuReDetector2D() if PuReDetector2D is not None else None
 
     def _apply_glass_quality_profile(self, profile_name):
         key = str(profile_name).strip().lower()
@@ -461,13 +477,45 @@ class EyeTracker:
         quality = float(np.clip(0.5 * support + 0.5 * np.clip(aspect / 0.6, 0.0, 1.0), 0.0, 1.0))
         return float(ecx), float(ecy), quality
 
+    def _detect_pupil_pure(self, gray_roi):
+        """
+        Pupil detection using PuRe (Pupil Labs) when pupil-detectors is installed.
+        Returns (x, y, conf) in ROI coordinates, or None if unavailable or no pupil.
+        """
+        if self._pupil_detector_2d is None or gray_roi is None or gray_roi.size == 0:
+            return None
+        h, w = gray_roi.shape[:2]
+        if h < 40 or w < 40:
+            return None
+        try:
+            result = self._pupil_detector_2d.detect(gray_roi)
+            ellipse = result.get("ellipse") if isinstance(result, dict) else getattr(result, "ellipse", None)
+            if ellipse is None:
+                return None
+            center = ellipse.get("center") if isinstance(ellipse, dict) else getattr(ellipse, "center", None)
+            if center is None or len(center) < 2:
+                return None
+            cx, cy = float(center[0]), float(center[1])
+            axes = ellipse.get("axes") if isinstance(ellipse, dict) else getattr(ellipse, "axes", (10.0, 10.0))
+            if axes is not None and len(axes) >= 2:
+                a, b = max(float(axes[0]), float(axes[1])), min(float(axes[0]), float(axes[1]))
+                area_frac = (np.pi * a * b) / float(h * w)
+                aspect = b / max(a, 1e-6)
+                if area_frac > 0.6 or area_frac < 0.001 or aspect < 0.2:
+                    return None
+                conf = float(np.clip(0.5 + 0.4 * min(aspect / 0.7, 1.0) + 0.1 * min(area_frac / 0.15, 1.0), 0.5, 1.0))
+            else:
+                conf = 0.85
+            if cx < 2 or cy < 2 or cx > (w - 3) or cy > (h - 3):
+                return None
+            return (cx, cy, conf)
+        except Exception:
+            return None
+
     def _detect_pupil_in_roi(self, gray_roi, prior_xy=None, allow_retry=True):
         """
         Robust pupil detector for glass-frame mode.
-        Tricks used:
-        - CLAHE contrast normalization
-        - Otsu dark-region threshold
-        - contour scoring by area + circularity
+        Tries PuRe (Pupil Labs) first when available, then contour + ray refinement.
         Returns (x, y, conf) in ROI coordinates.
         """
         if gray_roi is None or gray_roi.size == 0:
@@ -477,7 +525,30 @@ class EyeTracker:
         if h < 8 or w < 8:
             return None
 
-        # PuReST-style local search around prediction from previous frame.
+        ox = 0
+        oy = 0
+        used_local_search = False
+
+        # Try PuRe first for higher accuracy when available
+        if self._pupil_detector_2d is not None:
+            roi_for_pure = roi_full
+            if prior_xy is not None:
+                px, py = int(prior_xy[0]), int(prior_xy[1])
+                r = int(max(40, min(self._glass_local_search_radius, min(w, h) // 2)))
+                x0 = max(0, px - r)
+                x1 = min(w, px + r)
+                y0 = max(0, py - r)
+                y1 = min(h, py + r)
+                if (x1 - x0) >= 40 and (y1 - y0) >= 40:
+                    used_local_search = True
+                    ox, oy = x0, y0
+                    roi_for_pure = roi_full[y0:y1, x0:x1]
+            pure_result = self._detect_pupil_pure(roi_for_pure)
+            if pure_result is not None:
+                cx, cy, conf = pure_result
+                return (cx + float(ox), cy + float(oy), conf)
+
+        # PuREST-style local search around prediction from previous frame (for fallback path).
         ox = 0
         oy = 0
         used_local_search = False
@@ -581,6 +652,19 @@ class EyeTracker:
         conf = float(np.clip((local_mean - float(min_val)) / 40.0, 0.0, 0.6))
         return float(min_loc[0] + ox), float(min_loc[1] + oy), conf
 
+    def _stabilize_glass_gaze(self, gx, gy):
+        """Apply temporal median and jump rejection to reduce jitter and spikes."""
+        self._glass_gaze_buf.append((float(gx), float(gy)))
+        arr = np.array(list(self._glass_gaze_buf), dtype=np.float64)
+        gx_m = float(np.median(arr[:, 0]))
+        gy_m = float(np.median(arr[:, 1]))
+        if self._last_glass_gaze is not None:
+            lgx, lgy = self._last_glass_gaze
+            if abs(gx_m - lgx) > GLASS_GAZE_JUMP_THRESH or abs(gy_m - lgy) > GLASS_GAZE_JUMP_THRESH:
+                gx_m, gy_m = lgx, lgy
+        self._last_glass_gaze = (gx_m, gy_m)
+        return gx_m, gy_m
+
     def _split_glass_rois(self, gray):
         h, w = gray.shape[:2]
         y0 = int(max(0, min(h - 1, h * GLASS_ROI_Y0)))
@@ -640,6 +724,7 @@ class EyeTracker:
 
         gx = float(0.5 * (gxL + gxR))
         gy = float(0.5 * (gyL + gyR))
+        gx, gy = self._stabilize_glass_gaze(gx, gy)
         self.left_eye_pupil_x = int(lx)
         self.left_eye_pupil_y = int(ly + y0_band)
         self.left_eye_pupil_x_norm = gx
@@ -684,6 +769,7 @@ class EyeTracker:
         gyR = (float(ry) / max(1.0, float(band_h))) - 0.5
         gx = float(0.5 * (gxL + gxR))
         gy = float(0.5 * (gyL + gyR))
+        gx, gy = self._stabilize_glass_gaze(gx, gy)
 
         # Glass-frame mode has no face pose; keep pose-related fields neutral.
         yaw = 0.0

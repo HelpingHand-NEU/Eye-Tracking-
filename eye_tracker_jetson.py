@@ -4,14 +4,20 @@ Eye Tracking Application
 Accesses both front and back cameras, tracks eyes, and overlays tracking on forward-facing camera.
 """
 
-import cv2
-import mediapipe as mp
+# Import numpy before cv2 to avoid ABI errors on Jetson. MediaPipe is lazy-imported
+# so CSI pupil-only test (test_csi_glass_frame_pupil.py) does not pull in NumPy 1.x deps.
+import json
 import numpy as np
+import cv2
 import sys
 import argparse
 import time
 import os
 from collections import deque
+
+# Default path for user-defined glass-frame eye regions (your own "landmarks").
+# When this file exists, pupil detection runs only inside these ROIs; no face detection.
+GLASS_FRAME_ROIS_FILENAME = "glass_frame_rois.json"
 
 
 class EyeTracker:
@@ -36,18 +42,31 @@ class EyeTracker:
         self.front_sensor_id = front_sensor_id
         self.back_sensor_id = back_sensor_id
         
-        # Initialize MediaPipe Face Mesh for eye tracking
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.mp_drawing_styles = mp.solutions.drawing_styles
-        
-        # Face mesh model with refined landmarks for better eye tracking
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
+        # MediaPipe is lazy-loaded in _ensure_mediapipe() to avoid import errors when
+        # only using CSI pupil detection (e.g. test_csi_glass_frame_pupil.py) with NumPy 2.x.
+        self._mediapipe_initialized = False
+        self.mp_face_mesh = None
+        # PuRe (pupil-detectors) for robust glass-frame pupil detection; lazy-loaded.
+        self._pupil_detector_2d = None
+        self._pupil_detector_initialized = False
+        # Glass-frame pupil refinement (match webcam algorithm: ray refinement + CLAHE)
+        self._glass_ray_count = 24
+        self._glass_ray_step = 2
+        self._glass_edge_grad_thresh = 7.0
+        self._glass_edge_min_bright = 45.0
+        # Kalman for single-eye glass-frame output (smooth pupil like webcam gaze)
+        self._glass_pupil_kalman = None
+        self._glass_pupil_last = None
+        # Crop to lower part of frame where eye sits (reduces false positives from ceiling/sky).
+        # 0.5 = lower half; 0.4 = lower 60%. Set to 0 to disable crop.
+        self.glass_eye_crop_y_start = 0.5
+        # User-defined eye regions ("custom landmarks") when glass frame blocks between eyes.
+        # List of (x, y, w, h) in normalized [0,1]; loaded from glass_frame_rois.json if present.
+        self._custom_glass_rois = None
+        self._custom_glass_rois_path = None
+        self.mp_drawing = None
+        self.mp_drawing_styles = None
+        self.face_mesh = None
         
         # Eye landmark indices (MediaPipe Face Mesh)
         # Left eye landmarks
@@ -113,6 +132,22 @@ class EyeTracker:
         self.kalman.statePre = np.zeros((4, 1), dtype=np.float32)
         self.kalman.statePost = np.zeros((4, 1), dtype=np.float32)
 
+    def _ensure_mediapipe(self):
+        """Lazy-init MediaPipe so CSI pupil-only scripts avoid NumPy/matplotlib ABI issues."""
+        if self._mediapipe_initialized:
+            return
+        import mediapipe as mp
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.mp_drawing_styles = mp.solutions.drawing_styles
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        self._mediapipe_initialized = True
+
     def _is_jetson(self):
         """Detect NVIDIA Jetson platforms."""
         return os.path.exists("/etc/nv_tegra_release")
@@ -125,28 +160,29 @@ class EyeTracker:
             return False
         return "GStreamer" in build_info and "YES" in build_info.split("GStreamer")[1].splitlines()[0]
 
-    def _build_csi_gstreamer_pipeline(self, sensor_id):
-        """Build a GStreamer pipeline for Jetson CSI cameras."""
-        # CSI sensors expose fixed modes; 640x480 is not guaranteed to exist.
-        # Fall back to a known mode if the requested size isn't typical.
-        width = self.camera_width
-        height = self.camera_height
-        fps = self.camera_fps
+    def _build_csi_gstreamer_pipeline(self, sensor_id, width=None, height=None, fps=None):
+        """Build a GStreamer pipeline for Jetson CSI cameras (IMX219 etc.)."""
+        w = width if width is not None else self.camera_width
+        h = height if height is not None else self.camera_height
+        f = fps if fps is not None else self.camera_fps
+        # IMX219 supported modes; prefer 1280x720@30 for compatibility (60 may fail on some stacks)
         supported_modes = {
             (3280, 2464, 21),
             (3280, 1848, 28),
             (1920, 1080, 30),
             (1640, 1232, 30),
             (1280, 720, 60),
+            (1280, 720, 30),
         }
-        if (width, height, fps) not in supported_modes:
-            width, height, fps = 1280, 720, 60
+        if (w, h, f) not in supported_modes:
+            w, h, f = 1280, 720, 30
+        # Explicit caps and nvvidconv output size improve compatibility with OpenCV appsink
         return (
             f"nvarguscamerasrc sensor-id={sensor_id} ! "
-            f"video/x-raw(memory:NVMM), width={width}, height={height}, "
-            f"format=NV12, framerate={fps}/1 ! "
-            "nvvidconv ! video/x-raw, format=BGRx ! "
-            "videoconvert ! video/x-raw, format=BGR ! appsink drop=1"
+            f"video/x-raw(memory:NVMM), width=(int){w}, height=(int){h}, "
+            f"format=(string)NV12, framerate=(fraction){f}/1 ! "
+            f"nvvidconv ! video/x-raw, format=(string)BGRx, width=(int){w}, height=(int){h} ! "
+            "videoconvert ! video/x-raw, format=(string)BGR ! appsink drop=1"
         )
 
     def _build_v4l2_gstreamer_pipeline(self, device_path):
@@ -405,6 +441,7 @@ class EyeTracker:
                     continue
                 
                 # Process frame
+                self._ensure_mediapipe()
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = self.face_mesh.process(rgb_frame)
                 
@@ -657,7 +694,37 @@ class EyeTracker:
             center = np.mean(iris_points, axis=0)
             return center
         return None
-    
+
+    def _get_eye_roi_rects(self, landmarks, h, w, padding_ratio=0.4):
+        """
+        Get left and right eye bounding rects (x0, y0, w_roi, h_roi) in pixel coords
+        from face landmarks. Returns ([left_rect], [right_rect]); each rect may be None.
+        """
+        def rect_for_eye(eye_points_norm):
+            if eye_points_norm is None or len(eye_points_norm) == 0:
+                return None
+            px = (eye_points_norm[:, 0] * w).astype(np.float32)
+            py = (eye_points_norm[:, 1] * h).astype(np.float32)
+            x_min, x_max = float(np.min(px)), float(np.max(px))
+            y_min, y_max = float(np.min(py)), float(np.max(py))
+            bw, bh = x_max - x_min, y_max - y_min
+            pad_w = max(8, bw * padding_ratio)
+            pad_h = max(8, bh * padding_ratio)
+            x0 = max(0, int(x_min - pad_w))
+            y0 = max(0, int(y_min - pad_h))
+            x1 = min(w, int(x_max + pad_w))
+            y1 = min(h, int(y_max + pad_h))
+            rw, rh = x1 - x0, y1 - y0
+            if rw < 30 or rh < 30:
+                return None
+            return (x0, y0, rw, rh)
+
+        left_pts = self.get_eye_landmarks(landmarks, self.LEFT_EYE_INDICES)
+        right_pts = self.get_eye_landmarks(landmarks, self.RIGHT_EYE_INDICES)
+        left_rect = rect_for_eye(left_pts)
+        right_rect = rect_for_eye(right_pts)
+        return left_rect, right_rect
+
     def draw_eye_tracking(self, image, landmarks, image_shape):
         """Draw eye tracking overlay on the image."""
         h, w = image_shape[:2]
@@ -895,6 +962,7 @@ class EyeTracker:
     
     def process_frame(self, frame, show_eye_tracking=True):
         """Process a single frame for eye tracking visualization."""
+        self._ensure_mediapipe()
         # Convert BGR to RGB for MediaPipe
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
@@ -910,6 +978,7 @@ class EyeTracker:
     
     def estimate_gaze_from_frame(self, frame):
         """Estimate gaze point from a frame without drawing, with smoothing."""
+        self._ensure_mediapipe()
         # Convert BGR to RGB for MediaPipe
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
@@ -925,9 +994,417 @@ class EyeTracker:
                     smoothed_gaze = self.smooth_gaze_point(gaze_point)
                     return smoothed_gaze
         
-        # If no face detected, return None (smoothing will handle it)
+        # Fallback: eye-only frame (glass-frame style) when no face landmarks
+        gaze_point = self.estimate_gaze_from_eye_frame(frame)
+        if gaze_point is not None:
+            smoothed_gaze = self.smooth_gaze_point(gaze_point)
+            return smoothed_gaze
         return None
-    
+
+    def _ensure_pupil_detector(self):
+        """Lazy-init PuRe (pupil-detectors) for glass-frame. No-op if not installed."""
+        if self._pupil_detector_initialized:
+            return
+        self._pupil_detector_initialized = True
+        try:
+            from pupil_detectors import Detector2D
+            self._pupil_detector_2d = Detector2D()
+        except Exception:
+            self._pupil_detector_2d = None
+
+    def _suppress_glints(self, gray_roi):
+        """Suppress bright specular highlights (glints) via inpainting for better pupil contrast."""
+        if gray_roi is None or gray_roi.size == 0:
+            return gray_roi
+        p = float(np.percentile(gray_roi, 99.3))
+        thr = int(max(220, min(250, p)))
+        mask = (gray_roi >= thr).astype(np.uint8) * 255
+        if cv2.countNonZero(mask) == 0:
+            return gray_roi
+        return cv2.inpaint(gray_roi, mask, 3, cv2.INPAINT_TELEA)
+
+    def _ellipse_support_score(self, ellipse, points):
+        """Return [0,1] score: how many points lie near the ellipse boundary."""
+        if ellipse is None or points is None or len(points) == 0:
+            return 0.0
+        (cx, cy), (ma, mi), angle = ellipse
+        axes = (max(1, int(ma * 0.5)), max(1, int(mi * 0.5)))
+        poly = cv2.ellipse2Poly((int(cx), int(cy)), axes, int(angle), 0, 360, 6)
+        if poly is None or len(poly) < 6:
+            return 0.0
+        contour = poly.reshape((-1, 1, 2)).astype(np.int32)
+        inliers = 0
+        for pt in points:
+            d = abs(float(cv2.pointPolygonTest(contour, (float(pt[0]), float(pt[1])), True)))
+            if d <= 3.0:
+                inliers += 1
+        return float(inliers) / max(1, len(points))
+
+    def _refine_pupil_center_with_rays(self, gray_blur, seed_xy):
+        """Starburst-like refinement: cast rays from center, find pupil boundary, fit ellipse. Returns (cx, cy, quality) or None."""
+        if gray_blur is None or gray_blur.size == 0 or seed_xy is None:
+            return None
+        h, w = gray_blur.shape[:2]
+        cx0, cy0 = float(seed_xy[0]), float(seed_xy[1])
+        if cx0 < 1 or cy0 < 1 or cx0 >= (w - 1) or cy0 >= (h - 1):
+            return None
+        max_r = int(max(12, min(w, h) * 0.45))
+        pts = []
+        angles = np.linspace(0.0, 2.0 * np.pi, self._glass_ray_count, endpoint=False)
+        for ang in angles:
+            dx, dy = float(np.cos(ang)), float(np.sin(ang))
+            px, py = int(round(cx0)), int(round(cy0))
+            prev = float(gray_blur[py, px])
+            best_pt, best_grad = None, 0.0
+            s = self._glass_ray_step
+            while s <= max_r:
+                x = int(round(cx0 + dx * s))
+                y = int(round(cy0 + dy * s))
+                if x < 1 or y < 1 or x >= (w - 1) or y >= (h - 1):
+                    break
+                val = float(gray_blur[y, x])
+                grad = val - prev
+                if grad > self._glass_edge_grad_thresh and val > self._glass_edge_min_bright and grad > best_grad:
+                    best_grad = grad
+                    best_pt = (x, y)
+                prev = val
+                s += self._glass_ray_step
+            if best_pt is not None:
+                pts.append(best_pt)
+        if len(pts) < 8:
+            return None
+        cnt = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
+        try:
+            ellipse = cv2.fitEllipse(cnt)
+        except Exception:
+            return None
+        (ecx, ecy), (ma, mi), _ = ellipse
+        a, b = max(float(ma), float(mi)), max(1e-6, min(float(ma), float(mi)))
+        aspect = b / a
+        if a < 6.0 or b < 3.0 or aspect < 0.18:
+            return None
+        support = self._ellipse_support_score(ellipse, pts)
+        quality = float(np.clip(0.5 * support + 0.5 * np.clip(aspect / 0.6, 0.0, 1.0), 0.0, 1.0))
+        return (float(ecx), float(ecy), quality)
+
+    def _detect_pupil_pure(self, gray):
+        """Run PuRe on grayscale image. Returns (cx, cy) in image coords or None."""
+        if self._pupil_detector_2d is None or gray is None or gray.size == 0:
+            return None
+        h, w = gray.shape[:2]
+        if h < 30 or w < 30:
+            return None
+        try:
+            result = self._pupil_detector_2d.detect(gray)
+            if result is None:
+                return None
+            ellipse = result.get("ellipse") if isinstance(result, dict) else getattr(result, "ellipse", None)
+            if ellipse is None:
+                return None
+            center = ellipse.get("center") if isinstance(ellipse, dict) else getattr(ellipse, "center", None)
+            if center is None or len(center) < 2:
+                return None
+            cx, cy = float(center[0]), float(center[1])
+            if cx < 1 or cy < 1 or cx >= (w - 1) or cy >= (h - 1):
+                return None
+            return (cx, cy)
+        except Exception:
+            return None
+
+    def _detect_pupil_center(self, frame):
+        """Detect pupil center in an eye-only (glass-frame) frame. Returns normalized (x, y) or None.
+        Uses same pipeline as webcam: PuRe or contour + CLAHE + glint suppress + ray refinement."""
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        except Exception:
+            return None
+        h, w = frame.shape[:2]
+        no_glint = self._suppress_glints(gray)
+        blur = cv2.GaussianBlur(no_glint, (7, 7), 0)
+
+        # 1) Try PuRe first (robust for head-mounted / glass-frame)
+        self._ensure_pupil_detector()
+        pure_xy = self._detect_pupil_pure(blur)
+        if pure_xy is not None:
+            # Require dark center (pupil) to avoid locking onto bright blobs
+            px, py = int(round(pure_xy[0])), int(round(pure_xy[1]))
+            if 3 <= px < w - 3 and 3 <= py < h - 3:
+                patch = blur[py - 3:py + 4, px - 3:px + 4]
+                if patch.size > 0 and np.mean(patch) < 140:
+                    return np.array([pure_xy[0] / w, pure_xy[1] / h], dtype=np.float32)
+            elif 1 <= px < w - 1 and 1 <= py < h - 1:
+                if blur[py, px] < 130:
+                    return np.array([pure_xy[0] / w, pure_xy[1] / h], dtype=np.float32)
+
+        # 2) Fallback: CLAHE + contour + ellipse + ray refinement (match webcam algorithm)
+        try:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            norm = clahe.apply(blur)
+        except Exception:
+            norm = cv2.equalizeHist(blur)
+        _, thresh = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            thresh2 = cv2.adaptiveThreshold(norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                            cv2.THRESH_BINARY_INV, 21, 5)
+            thresh2 = cv2.morphologyEx(thresh2, cv2.MORPH_OPEN, kernel)
+            thresh2 = cv2.morphologyEx(thresh2, cv2.MORPH_CLOSE, kernel)
+            contours, _ = cv2.findContours(thresh2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        frame_area = float(h * w)
+        best = None
+        best_score = -1.0
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 30 or area > frame_area * 0.12:
+                continue
+            if len(cnt) < 5:
+                continue
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            if x <= 2 or y <= 2 or (x + bw) >= (w - 3) or (y + bh) >= (h - 3):
+                continue
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter <= 0:
+                continue
+            circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+            if circularity < 0.35:
+                continue
+            aspect = min(bw, bh) / max(float(max(bw, bh)), 1e-6)
+            if aspect < 0.45 or aspect > 1.0:
+                continue
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(mask, [cnt], -1, 255, -1)
+            mean_in = cv2.mean(blur, mask=mask)[0]
+            if mean_in > 100:
+                continue
+            ring = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+            ring = cv2.subtract(ring, mask)
+            if np.count_nonzero(ring) == 0:
+                continue
+            mean_ring = cv2.mean(blur, mask=ring)[0]
+            contrast = mean_ring - mean_in
+            if contrast < 10:
+                continue
+            ecc_pen = 1.0
+            if len(cnt) >= 5:
+                try:
+                    (_, _), (ma, mi), _ = cv2.fitEllipse(cnt)
+                    a, b = max(float(ma), float(mi)), max(1e-6, min(float(ma), float(mi)))
+                    ecc = np.sqrt(max(0.0, 1.0 - (b * b) / (a * a)))
+                    ecc_pen = np.clip(1.0 - 0.5 * ecc, 0.5, 1.0)
+                except Exception:
+                    pass
+            border_pen = 1.0
+            m = cv2.moments(cnt)
+            if m["m00"] > 1e-6:
+                cx_m = m["m10"] / m["m00"]
+                cy_m = m["m01"] / m["m00"]
+                if cx_m < 6 or cx_m > (w - 6) or cy_m < 6 or cy_m > (h - 6):
+                    border_pen = 0.5
+            score = (area * 0.3 + circularity * 100 + contrast * 0.5) * ecc_pen * border_pen
+            if score > best_score:
+                best_score = score
+                best = cnt
+        if best is None or len(best) < 5 or best_score < 25.0:
+            return None
+        try:
+            ellipse = cv2.fitEllipse(best)
+            ((cx, cy), (ma, MA), angle) = ellipse
+            cx, cy = float(cx), float(cy)
+        except Exception:
+            m = cv2.moments(best)
+            if m["m00"] == 0:
+                return None
+            cx = m["m10"] / m["m00"]
+            cy = m["m01"] / m["m00"]
+        # Ray refinement (same as webcam): sub-pixel pupil boundary -> better center
+        refined = self._refine_pupil_center_with_rays(blur, (cx, cy))
+        if refined is not None:
+            rcx, rcy, rq = refined
+            alpha = float(np.clip(0.25 + 0.55 * rq, 0.25, 0.8))
+            cx = (1.0 - alpha) * cx + alpha * rcx
+            cy = (1.0 - alpha) * cy + alpha * rcy
+        if cx < 0 or cy < 0 or cx >= w or cy >= h:
+            return None
+        return np.array([cx / w, cy / h], dtype=np.float32)
+
+    def _pupil_from_face_mesh(self, frame):
+        """If frame contains a face, return normalized (x,y) pupil from iris landmarks else None."""
+        self._ensure_mediapipe()
+        if self.face_mesh is None:
+            return None
+        try:
+            h, w = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = self.face_mesh.process(rgb)
+            if not results.multi_face_landmarks or len(results.multi_face_landmarks) == 0:
+                return None
+            landmarks = results.multi_face_landmarks[0]
+            left_iris = self.get_iris_center(landmarks, self.LEFT_IRIS_INDICES)
+            right_iris = self.get_iris_center(landmarks, self.RIGHT_IRIS_INDICES)
+            if left_iris is not None and right_iris is not None:
+                cx = (left_iris[0] + right_iris[0]) / 2.0
+                cy = (left_iris[1] + right_iris[1]) / 2.0
+            elif left_iris is not None:
+                cx, cy = left_iris[0], left_iris[1]
+            elif right_iris is not None:
+                cx, cy = right_iris[0], right_iris[1]
+            else:
+                return None
+            return np.array([cx, cy], dtype=np.float32)
+        except Exception:
+            return None
+
+    def _pupil_from_eye_landmark_rois(self, frame):
+        """
+        Detect that a pair of eyes is visible via Face Mesh, then run pupil detection
+        only within the left and right eye ROIs. Returns normalized (x,y) gaze or None.
+        """
+        self._ensure_mediapipe()
+        if self.face_mesh is None:
+            return None
+        try:
+            full_h, full_w = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = self.face_mesh.process(rgb)
+            if not results.multi_face_landmarks or len(results.multi_face_landmarks) == 0:
+                return None
+            landmarks = results.multi_face_landmarks[0]
+            left_rect, right_rect = self._get_eye_roi_rects(landmarks, full_h, full_w)
+            pupils = []
+            for rect in (left_rect, right_rect):
+                if rect is None:
+                    continue
+                x0, y0, rw, rh = rect
+                roi = frame[y0:y0 + rh, x0:x0 + rw]
+                if roi.size == 0 or roi.shape[0] < 20 or roi.shape[1] < 20:
+                    continue
+                pupil_norm = self._detect_pupil_center(roi)
+                if pupil_norm is not None:
+                    nx, ny = float(pupil_norm[0]), float(pupil_norm[1])
+                    full_x = (x0 + nx * rw) / full_w
+                    full_y = (y0 + ny * rh) / full_h
+                    pupils.append(np.array([full_x, full_y], dtype=np.float32))
+            if len(pupils) == 2:
+                return (pupils[0] + pupils[1]) * 0.5
+            if len(pupils) == 1:
+                return pupils[0]
+            return None
+        except Exception:
+            return None
+
+    def _load_custom_glass_rois(self):
+        """Load user-defined eye ROIs from glass_frame_rois.json (your own landmarks). Called lazily."""
+        if self._custom_glass_rois is not None:
+            return
+        for base in (os.getcwd(), os.path.dirname(os.path.abspath(__file__))):
+            path = os.path.join(base, GLASS_FRAME_ROIS_FILENAME)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+                rois = []
+                for key in ("left_eye_roi", "right_eye_roi"):
+                    r = data.get(key)
+                    if r and len(r) >= 4:
+                        x, y, w, h = float(r[0]), float(r[1]), float(r[2]), float(r[3])
+                        if w > 0.02 and h > 0.02 and 0 <= x <= 1 and 0 <= y <= 1:
+                            rois.append((x, y, w, h))
+                if rois:
+                    self._custom_glass_rois = rois
+                    self._custom_glass_rois_path = path
+            except Exception:
+                pass
+            break
+
+    def _pupil_from_custom_glass_rois(self, frame):
+        """Run pupil detection only inside user-defined eye ROIs. Returns normalized (x,y) or None."""
+        self._load_custom_glass_rois()
+        if not self._custom_glass_rois:
+            return None
+        full_h, full_w = frame.shape[:2]
+        pupils = []
+        for (nx, ny, nw, nh) in self._custom_glass_rois:
+            x0 = int(nx * full_w)
+            y0 = int(ny * full_h)
+            rw = max(20, int(nw * full_w))
+            rh = max(20, int(nh * full_h))
+            x0 = max(0, min(x0, full_w - rw))
+            y0 = max(0, min(y0, full_h - rh))
+            roi = frame[y0:y0 + rh, x0:x0 + rw]
+            if roi.size == 0 or roi.shape[0] < 20 or roi.shape[1] < 20:
+                continue
+            pupil_norm = self._detect_pupil_center(roi)
+            if pupil_norm is not None:
+                px = (x0 + pupil_norm[0] * rw) / full_w
+                py = (y0 + pupil_norm[1] * rh) / full_h
+                pupils.append(np.array([px, py], dtype=np.float32))
+        if len(pupils) == 2:
+            return (pupils[0] + pupils[1]) * 0.5
+        if len(pupils) == 1:
+            return pupils[0]
+        return None
+
+    def _crop_glass_eye_roi(self, frame):
+        """Crop to lower part of frame where the eye/pupil is (reduces false positives from ceiling/sky)."""
+        if frame is None or frame.size == 0:
+            return None, None
+        h, w = frame.shape[:2]
+        if self.glass_eye_crop_y_start <= 0 or self.glass_eye_crop_y_start >= 1.0:
+            return frame, (0, 0, w, h)
+        y0 = int(h * self.glass_eye_crop_y_start)
+        if y0 >= h - 20:
+            return frame, (0, 0, w, h)
+        crop = frame[y0:, :].copy()
+        return crop, (0, y0, w, h - y0)
+
+    def estimate_gaze_from_eye_frame(self, frame):
+        """Estimate gaze from glass-frame camera: no face detection (camera cannot capture full face).
+        Uses: custom ROIs (glass_frame_rois.json) if present, else lower-half crop + pupil detection, then Kalman."""
+        raw = self._pupil_from_custom_glass_rois(frame)
+        if raw is None:
+            cropped, crop_rect = self._crop_glass_eye_roi(frame)
+            if cropped is not None and crop_rect is not None:
+                raw = self._detect_pupil_center(cropped)
+                if raw is not None:
+                    _, y0, cw, ch = crop_rect
+                    full_h, full_w = frame.shape[:2]
+                    raw = np.array([
+                        raw[0],
+                        (y0 + raw[1] * ch) / full_h
+                    ], dtype=np.float32)
+            if raw is None:
+                raw = self._detect_pupil_center(frame)
+        if raw is None:
+            self._glass_pupil_last = None
+            return None
+        raw = np.asarray(raw, dtype=np.float32).reshape(2)
+        # Kalman smooth (same idea as webcam gaze path)
+        if self._glass_pupil_kalman is None:
+            self._glass_pupil_kalman = cv2.KalmanFilter(4, 2)
+            self._glass_pupil_kalman.transitionMatrix = np.array(
+                [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32)
+            self._glass_pupil_kalman.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32)
+            self._glass_pupil_kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.008
+            self._glass_pupil_kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.12
+            self._glass_pupil_kalman.errorCovPost = np.eye(4, dtype=np.float32)
+            self._glass_pupil_kalman.statePost = np.array([[raw[0]], [raw[1]], [0.0], [0.0]], dtype=np.float32)
+        self._glass_pupil_kalman.predict()
+        self._glass_pupil_kalman.correct(np.array([[raw[0]], [raw[1]]], dtype=np.float32))
+        smoothed = np.array([self._glass_pupil_kalman.statePost[0, 0], self._glass_pupil_kalman.statePost[1, 0]], dtype=np.float32)
+        # Reject large jumps (outlier) to avoid glitches
+        if self._glass_pupil_last is not None:
+            jump = np.sqrt(np.sum((smoothed - self._glass_pupil_last) ** 2))
+            if jump > 0.12:
+                smoothed = self._glass_pupil_last.copy()
+        self._glass_pupil_last = smoothed
+        return smoothed
+
     def run(self):
         """Main loop to run the eye tracking application."""
         if not self.initialize_cameras():
