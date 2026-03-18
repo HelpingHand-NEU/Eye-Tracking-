@@ -1,0 +1,3 @@
+[submodule "vendor/EyeTracker"]
+	path = vendor/EyeTracker
+	url = https://github.com/JEOresearch/EyeTracker.git
