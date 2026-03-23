@@ -1,6 +1,7 @@
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from collections import Counter, deque
 
 import cv2
 import numpy as np
@@ -26,6 +27,7 @@ from .glass_frame_jeo_tracker import (
     load_rois_and_signature,
     _build_csi_pipeline,
     _roi_to_pixel_rect,
+    CSI_FPS,
 )
 
 # No recording until user has started and quality is sufficient
@@ -39,7 +41,6 @@ WIN_FRONT_LEFT = "2. Left eye CROPPED"
 WIN_FRONT_RIGHT = "3. Right eye CROPPED"
 WIN_BACK = "4. Back camera (AprilTag)"
 INFO_STRIP_H = 72
-
 
 def _crop_with_info_strip(crop_bgr, color_bgr, lines):
     """Stack crop and info strip with text lines (same as test script)."""
@@ -71,6 +72,9 @@ class GlassFrameTrainingConfig:
         apriltag_width=None,   # meters (if None, same as length)
         apriltag_focal_px=700.0,
         tag_ids=(1, 2, 3, 4, 5),
+        # If set: fixed tag list (testing / no discovery). If None (default): count & order come from
+        # the back camera during session start (unique IDs seen while you show the board).
+        tag_calibration_order=None,
         apriltag_families="tag36h11",
         tag_image_dir=None,
         tag_display_px=260,
@@ -87,6 +91,11 @@ class GlassFrameTrainingConfig:
         tag_camera_buffer_drain=2,  # grab N buffered frames before decode — fresher tag video (CSI)
         overlap_tag_eye_detection=True,  # run AprilTag on tag frame while JEO runs (same frame, smoother loop)
         tag_quad_decimate=1.0,  # pupil-apriltags speedup; 1.0 = full accuracy, 2.0 = faster
+        tag_detect_scale=1.0,  # <1.0 runs AprilTag on a downscaled frame (faster, slightly less precise)
+        record_every_n_frames=2,  # downsample writes to reduce IO/CPU while preserving coverage
+        stability_window_frames=5,  # only record after this many recent samples are available
+        stability_std_threshold=0.025,  # max std on gxL/gyL/gxR/gyR for stable recording
+        aggregate_group_size=4,  # median-aggregate this many valid frames into one row
     ):
         self.calibration_mode = calibration_mode
         self.screen_size = screen_size
@@ -102,6 +111,9 @@ class GlassFrameTrainingConfig:
         self.apriltag_width = float(apriltag_width) if apriltag_width is not None else float(apriltag_length)
         self.apriltag_focal_px = float(apriltag_focal_px)
         self.tag_ids = list(tag_ids)
+        self.tag_calibration_order = (
+            tuple(int(x) for x in tag_calibration_order) if tag_calibration_order is not None else None
+        )
         self.apriltag_families = apriltag_families
         if tag_image_dir is None:
             tag_image_dir = os.path.expanduser("~/Downloads/apriltags_tag36h11")
@@ -120,6 +132,11 @@ class GlassFrameTrainingConfig:
         self.tag_camera_buffer_drain = int(tag_camera_buffer_drain)
         self.overlap_tag_eye_detection = bool(overlap_tag_eye_detection)
         self.tag_quad_decimate = float(tag_quad_decimate)
+        self.tag_detect_scale = float(tag_detect_scale)
+        self.record_every_n_frames = int(record_every_n_frames)
+        self.stability_window_frames = int(stability_window_frames)
+        self.stability_std_threshold = float(stability_std_threshold)
+        self.aggregate_group_size = int(aggregate_group_size)
 
 
 class GlassFrameTraining:
@@ -151,6 +168,11 @@ class GlassFrameTraining:
             families=self.config.apriltag_families,
             quad_decimate=max(1.0, float(self.config.tag_quad_decimate)),
         )
+        # On-screen feedback after S (manual calibration)
+        self._checkpoint_banner_until = 0.0
+        self._checkpoint_banner_line1 = ""
+        self._checkpoint_banner_line2 = ""
+        self._checkpoint_banner_ok = True
 
     @staticmethod
     def _grab_latest_tag_frame(cap, drain: int):
@@ -169,9 +191,93 @@ class GlassFrameTraining:
         if frame is None or not hasattr(frame, "size") or frame.size == 0:
             return []
         try:
+            scale = float(getattr(self.config, "tag_detect_scale", 1.0))
+            if 0 < scale < 1.0:
+                small = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                dets = self.tag_detector.detect(small)
+                inv = 1.0 / scale
+                out = []
+                for d in dets:
+                    x, y, w, h = d["bbox"]
+                    cx, cy = d.get("center", (x + 0.5 * w, y + 0.5 * h))
+                    nd = {
+                        **d,
+                        "bbox": (int(round(x * inv)), int(round(y * inv)), int(round(w * inv)), int(round(h * inv))),
+                        "center": (float(cx) * inv, float(cy) * inv),
+                    }
+                    corners = d.get("corners")
+                    if corners:
+                        nd["corners"] = [(float(c[0]) * inv, float(c[1]) * inv) for c in corners]
+                    out.append(nd)
+                return out
             return self.tag_detector.detect(frame)
         except Exception:
             return []
+
+    def _is_stable(self, recent_fv4):
+        if len(recent_fv4) < max(2, self.config.stability_window_frames):
+            return False
+        arr = np.asarray(recent_fv4, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[1] != 4:
+            return False
+        std = np.std(arr, axis=0)
+        return bool(np.max(std) <= float(self.config.stability_std_threshold))
+
+    @staticmethod
+    def _median_pair(values):
+        vals = [v for v in values if v is not None and len(v) >= 2]
+        if not vals:
+            return None
+        a = np.asarray(vals, dtype=np.float64)
+        return float(np.median(a[:, 0])), float(np.median(a[:, 1]))
+
+    def _aggregate_candidates_to_row(self, candidates, stage, screen_xy, screen_size, tag_frame_size):
+        """Aggregate several nearby samples into one robust row (median of fv/conf/pupil/tag geometry)."""
+        if not candidates:
+            return None
+        fv = np.median(np.asarray([c["fv"] for c in candidates], dtype=np.float64), axis=0)
+        conf = float(np.median(np.asarray([c["conf"] for c in candidates], dtype=np.float64)))
+
+        # Aggregate pupil points to damp micro-jitter in the saved rows.
+        self._last_pupil_left_norm = self._median_pair([c.get("pupil_left_norm") for c in candidates])
+        self._last_pupil_right_norm = self._median_pair([c.get("pupil_right_norm") for c in candidates])
+        self._last_pupil_left_full = self._median_pair([c.get("pupil_left_full") for c in candidates])
+        self._last_pupil_right_full = self._median_pair([c.get("pupil_right_full") for c in candidates])
+
+        dets = [c.get("det") for c in candidates if c.get("det") is not None]
+        det_agg = None
+        if dets:
+            b = np.asarray([d["bbox"] for d in dets], dtype=np.float64)
+            x, y, w, h = np.median(b, axis=0).tolist()
+            centers = []
+            for d in dets:
+                center = d.get("center")
+                if center is not None and len(center) >= 2:
+                    centers.append((float(center[0]), float(center[1])))
+                else:
+                    bx, by, bw, bh = d["bbox"]
+                    centers.append((bx + 0.5 * bw, by + 0.5 * bh))
+            cx, cy = self._median_pair(centers) if centers else (x + 0.5 * w, y + 0.5 * h)
+            ids = [d.get("tag_id") for d in dets if d.get("tag_id") is not None]
+            tag_id = Counter(ids).most_common(1)[0][0] if ids else None
+            det_agg = {"bbox": (int(x), int(y), int(w), int(h)), "center": (float(cx), float(cy)), "tag_id": tag_id}
+            corners_all = [d.get("corners") for d in dets if d.get("corners") is not None and len(d.get("corners")) >= 4]
+            if corners_all:
+                med_corners = []
+                for i in range(4):
+                    pts = [(float(c[i][0]), float(c[i][1])) for c in corners_all]
+                    med_corners.append(self._median_pair(pts))
+                det_agg["corners"] = med_corners
+
+        return self._make_training_row(
+            fv=fv,
+            conf=conf,
+            stage=stage,
+            screen_xy=screen_xy,
+            screen_size=screen_size,
+            tag_det=det_agg,
+            tag_frame_size=tag_frame_size,
+        )
 
     def _write_roi_meta_if_needed(self):
         """Write ROI metadata next to the training CSV so you can see which ROI set a file belongs to (for fallback/reuse)."""
@@ -208,15 +314,376 @@ class GlassFrameTraining:
             return float(0.5 * (z_w + z_h))
         return z_w if z_w is not None else z_h
 
+    def _ordered_tag_id_list(self):
+        """Current calibration tag order (from camera discovery or config override)."""
+        ids = getattr(self, "_ordered_tag_ids", None)
+        return list(ids) if ids else list(self.config.tag_ids)
+
     def _load_tag_images(self):
         out = {}
-        for tag_id in self.config.tag_ids:
+        for tag_id in self._ordered_tag_id_list():
             name = f"tag36_11_{tag_id:05d}.png"
             path = os.path.join(self.config.tag_image_dir, name)
             img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
             if img is not None:
                 out[tag_id] = img
         return out
+
+    def _resolve_ordered_tag_ids_from_config_only(self):
+        """Fixed list from config only (no camera). Used when tag_calibration_order is set."""
+        explicit = getattr(self.config, "tag_calibration_order", None)
+        if explicit is None:
+            return None
+        if len(explicit) == 0:
+            raise ValueError("calibration.tag_ids must be non-empty when used as override.")
+        return list(explicit)
+
+    def _discover_tag_ids_from_camera(self, tag_cap, tracker):
+        """Build sorted tag ID list from unique AprilTags the back camera has seen (user shows board).
+
+        Caller must create all four calibration windows first. Updates front-camera views every frame
+        so manual calibration always shows the same 4 windows as the main loop.
+        """
+        seen = set()
+        drain = self.config.tag_camera_buffer_drain
+        while True:
+            # Must run JEO pipeline before drawing — get_last_full_frame() is only set inside
+            # process_frame_binocular() (same as the main calibration loop via _collect_feature).
+            if tracker is not None:
+                tracker.process_frame_binocular()
+                self._draw_front_camera_windows(tracker)
+            ret, frame = self._grab_latest_tag_frame(tag_cap, drain)
+            if not ret or frame is None:
+                preview = np.zeros((480, 640, 3), dtype=np.uint8)
+                dets = []
+            else:
+                preview = frame.copy()
+                dets = self._detect_tag_frame(frame)
+                for d in dets:
+                    tid = d.get("tag_id")
+                    if tid is not None:
+                        seen.add(int(tid))
+                for d in dets:
+                    x, y, w, h = d["bbox"]
+                    cv2.rectangle(preview, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    t = d.get("tag_id", "?")
+                    cv2.putText(preview, str(t), (x, max(20, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+            th, tw = preview.shape[:2]
+            ids_sorted = sorted(seen)
+            id_str = str(ids_sorted) if ids_sorted else "(none yet)"
+            if len(id_str) > 90:
+                id_str = id_str[:87] + "..."
+            lines = [
+                "TAG DISCOVERY (back camera)",
+                "Show the calibration board; pan so each tag is visible at least once.",
+                f"Unique IDs seen: {len(seen)}  {id_str}",
+                "SPACE = done   R = clear list   Q = quit",
+            ]
+            y = 24
+            for line in lines:
+                cv2.putText(preview, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 2)
+                y += 24
+            cv2.imshow(WIN_BACK, preview)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                raise RuntimeError("Calibration cancelled during tag discovery (Q).")
+            if key == ord("r"):
+                seen.clear()
+            if key == ord(" "):
+                if len(seen) < 1:
+                    print("[glass_frame] No tags detected yet — show the board to the back camera, or press R and retry.")
+                    continue
+                order = sorted(seen)
+                print(f"[glass_frame] Discovery done: {len(order)} tag(s) {order}")
+                return order
+
+    def _resolve_tag_order_after_camera_open(self, tag_cap, tracker):
+        """Return ordered tag ID list: config override, else live discovery."""
+        fixed = self._resolve_ordered_tag_ids_from_config_only()
+        if fixed is not None:
+            self._ordered_tag_ids = tuple(fixed)
+            self.config.tag_ids = list(fixed)
+            return fixed
+        order = self._discover_tag_ids_from_camera(tag_cap, tracker)
+        self._ordered_tag_ids = tuple(order)
+        self.config.tag_ids = list(order)
+        return order
+
+    def _manual_flush_new_rows(self, rows_all, already_written: int) -> tuple[int, int]:
+        """Validate and append rows_all[already_written:] to CSV.
+
+        Returns:
+            (new_already_written, num_appended)
+        Only advances ``new_already_written`` past pending rows when at least one row was
+        written — otherwise the same pending slice is retried on the next S (fixes
+        \"must press S many times\" when validation first dropped everything).
+        """
+        if already_written >= len(rows_all):
+            return already_written, 0
+        pending = rows_all[already_written:]
+        chunk = self._validate_rows(pending)
+        if not chunk:
+            print(
+                "[glass_frame] Checkpoint (S): no valid rows in pending buffer yet — "
+                "nothing written; try again after more recording or check gaze/tag data."
+            )
+            return already_written, 0
+        self.calib._append_training_rows(chunk)
+        n_pending = len(pending)
+        n_ok = len(chunk)
+        if n_ok < n_pending:
+            print(f"[glass_frame] Checkpoint: wrote {n_ok} of {n_pending} pending row(s); rest failed validation.")
+        print(
+            f"[glass_frame] Saved +{n_ok} row(s). Session rows: {len(rows_all)}. "
+            f"CSV: {self.calib.current_training_data_path}"
+        )
+        return already_written + n_pending, n_ok
+
+    def _set_checkpoint_banner(
+        self, *, ok: bool, line1: str, line2: str = "", duration_sec: float = 4.5
+    ) -> None:
+        """Large on-screen feedback on the back-camera preview after S (or auto-flush)."""
+        self._checkpoint_banner_until = time.monotonic() + float(duration_sec)
+        self._checkpoint_banner_line1 = line1
+        self._checkpoint_banner_line2 = line2
+        self._checkpoint_banner_ok = ok
+
+    def _draw_manual_back_camera_ui(
+        self,
+        preview,
+        tag_images,
+        all_dets,
+        *,
+        recording,
+        session_complete,
+        just_paused,
+        tag_idx,
+        tag_order,
+        checkpoint_saved=False,
+        unsaved_pending=False,
+    ):
+        """Back camera: RED = next tag to look at (paused). LIME = tag to record (running) or just recorded (paused)."""
+        th, tw = preview.shape[:2]
+        current_id = tag_order[tag_idx] if tag_idx < len(tag_order) else None
+
+        def _q_hint():
+            if session_complete:
+                return None
+            if checkpoint_saved and not unsaved_pending:
+                return "Q = quit (data saved to CSV)"
+            if checkpoint_saved and unsaved_pending:
+                return "Q = quit (checkpoint saved; press S again to save newest rows)"
+            return "Q = quit without saving — press S first to save"
+
+        q_line = _q_hint()
+
+        # red_next_id: upcoming tag (only when paused — what to prepare for)
+        # lime_id: tag user should fixate while recording, OR tag just finished when paused
+        red_next_id = None
+        lime_id = None
+
+        if session_complete:
+            lines = [
+                "CALIBRATION COMPLETE",
+                "All tags recorded; data flushed to CSV.",
+                "Q = exit and run training   S = re-save checkpoint if needed",
+            ]
+            if tag_order:
+                lime_id = tag_order[-1]
+        elif recording:
+            lines = [
+                f"RECORDING — look at AprilTag ID {current_id} (lime)",
+                f"Progress: tag {tag_idx + 1} of {len(tag_order)}",
+                "SPACE = pause",
+            ]
+            if q_line:
+                lines.append(q_line)
+            lime_id = current_id
+        elif just_paused:
+            lime_id = tag_order[tag_idx] if tag_idx < len(tag_order) else None
+            if tag_idx + 1 < len(tag_order):
+                red_next_id = tag_order[tag_idx + 1]
+                nid = red_next_id
+                lines = [
+                    "PAUSED",
+                    f"LIME = tag you just recorded  |  RED = next: AprilTag ID {nid}",
+                    f"Press SPACE to record tag {tag_idx + 2}/{len(tag_order)}",
+                    "S = save progress to CSV",
+                ]
+            else:
+                lines = [
+                    "PAUSED — last tag recorded",
+                    "LIME = tag you just finished  |  Press SPACE to end session",
+                ]
+            if q_line:
+                lines.append(q_line)
+        else:
+            red_next_id = tag_order[tag_idx] if tag_idx < len(tag_order) else None
+            nid = red_next_id
+            lines = [
+                "PAUSED — get ready",
+                f"RED = look at AprilTag ID {nid} next, then SPACE to start recording",
+                "S = save progress to CSV",
+            ]
+            if q_line:
+                lines.append(q_line)
+
+        y = 32
+        for line in lines:
+            cv2.putText(preview, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 255), 2)
+            y += 28
+
+        # Big temporary banner after pressing S (success or failure)
+        now = time.monotonic()
+        if now < getattr(self, "_checkpoint_banner_until", 0):
+            b1 = getattr(self, "_checkpoint_banner_line1", "") or ""
+            b2 = getattr(self, "_checkpoint_banner_line2", "") or ""
+            ok = getattr(self, "_checkpoint_banner_ok", True)
+            bar_top = min(y + 4, th - 130)
+            bar_h = 56 if b2 else 44
+            bg = (50, 170, 50) if ok else (50, 70, 230)
+            cv2.rectangle(preview, (0, bar_top), (tw, bar_top + bar_h), bg, -1)
+            cv2.rectangle(preview, (0, bar_top), (tw, bar_top + bar_h), (255, 255, 255), 2)
+            cv2.putText(
+                preview, b1, (12, bar_top + 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.78, (255, 255, 255), 2,
+            )
+            if b2:
+                cv2.putText(
+                    preview, b2, (12, bar_top + 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (240, 255, 240), 1,
+                )
+
+        # Always-visible save state (stack above footer; avoid clash with tag-not-visible at th-68)
+        ps_y = th - 48
+        if session_complete:
+            if unsaved_pending:
+                ps, pc = "SAVE STATUS: Rows not on disk — press S, then Q.", (0, 165, 255)
+            elif checkpoint_saved:
+                ps, pc = "SAVE STATUS: All rows saved to CSV — safe to press Q.", (80, 255, 100)
+            else:
+                ps, pc = "SAVE STATUS: No CSV write yet — press S or Q.", (100, 200, 255)
+            cv2.putText(preview, ps, (12, ps_y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, pc, 2)
+        else:
+            if checkpoint_saved and not unsaved_pending:
+                ps, pc = "SAVE STATUS: All data in memory is saved to CSV.", (80, 255, 100)
+            elif checkpoint_saved and unsaved_pending:
+                ps, pc = "SAVE STATUS: New rows not saved — press S again before Q.", (0, 255, 255)
+            else:
+                ps, pc = "SAVE STATUS: Nothing on disk yet — press S while paused.", (100, 200, 255)
+            cv2.putText(preview, ps, (12, ps_y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, pc, 2)
+
+        footer = "SPACE = start / pause / advance tag     S = save checkpoint"
+        if session_complete:
+            footer += "     Q = quit"
+        elif checkpoint_saved and not unsaved_pending:
+            footer += "     Q = quit (saved)"
+        elif checkpoint_saved:
+            footer += "     Q = quit (S again if more rows)"
+        else:
+            footer += "     Q = quit (use S to save first)"
+        cv2.putText(
+            preview,
+            footer,
+            (12, th - 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (200, 200, 200),
+            1,
+        )
+
+        thumb = 130
+        margin = 8
+        gap = 6
+        color_next_red = (0, 0, 255)
+        color_lime = (50, 255, 80)
+        x0 = tw - thumb - margin
+        y_thumb = margin
+
+        def _paste_thumb(tag_id, y_top, border_color, caption):
+            if tag_id is None or tag_id not in tag_images:
+                return y_top
+            tg = cv2.resize(tag_images[tag_id], (thumb, thumb), interpolation=cv2.INTER_NEAREST)
+            tgc = cv2.cvtColor(tg, cv2.COLOR_GRAY2BGR)
+            preview[y_top : y_top + thumb, x0 : x0 + thumb] = tgc
+            cv2.rectangle(preview, (x0, y_top), (x0 + thumb, y_top + thumb), border_color, 3)
+            cv2.putText(
+                preview,
+                caption,
+                (x0, min(th - 6, y_top + thumb + 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                border_color,
+                2,
+            )
+            return y_top + thumb + gap
+
+        # Thumbnails: while recording = lime only; paused = red (next) above lime (just recorded)
+        if recording:
+            if lime_id is not None:
+                _paste_thumb(lime_id, margin, color_lime, f"LIME look {lime_id}")
+        else:
+            if red_next_id is not None:
+                y_thumb = _paste_thumb(red_next_id, y_thumb, color_next_red, f"RED next {red_next_id}")
+            if lime_id is not None and (just_paused or session_complete):
+                cap = f"LIME last {lime_id}" if session_complete else f"LIME done {lime_id}"
+                y_thumb = _paste_thumb(lime_id, y_thumb, color_lime, cap)
+
+        def _draw_one_tag_box(tid, color, label):
+            if tid is None or not all_dets:
+                return False
+            for d in all_dets:
+                if d.get("tag_id") != tid:
+                    continue
+                x, y, w, h = d["bbox"]
+                cv2.rectangle(preview, (x, y), (x + w, y + h), color, 3)
+                cv2.putText(
+                    preview,
+                    label,
+                    (x, max(22, y - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    color,
+                    2,
+                )
+                return True
+            return False
+
+        if recording:
+            _draw_one_tag_box(lime_id, color_lime, f"LOOK (lime) id {lime_id}")
+        elif session_complete:
+            _draw_one_tag_box(lime_id, color_lime, f"LAST (lime) id {lime_id}")
+        else:
+            if lime_id is not None:
+                _draw_one_tag_box(lime_id, color_lime, f"JUST DONE (lime) id {lime_id}")
+            if red_next_id is not None:
+                _draw_one_tag_box(red_next_id, color_next_red, f"NEXT (red) id {red_next_id}")
+
+        if not recording and red_next_id is not None and all_dets:
+            visible_next = any(d.get("tag_id") == red_next_id for d in all_dets)
+            if not visible_next:
+                cv2.putText(
+                    preview,
+                    f"RED next tag {red_next_id} not visible — show it to this camera",
+                    (12, th - 42),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.58,
+                    (0, 140, 255),
+                    2,
+                )
+
+        if all_dets:
+            skip = {tid for tid in (lime_id, red_next_id) if tid is not None}
+            if recording and current_id is not None:
+                skip.add(current_id)
+            for d in all_dets:
+                tid = d.get("tag_id")
+                x, y, w, h = d["bbox"]
+                muted = (80, 80, 80)
+                if tid in skip:
+                    continue
+                cv2.rectangle(preview, (x, y), (x + w, y + h), muted, 1)
+                cv2.putText(preview, f"id {tid}", (x, max(18, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, muted, 1)
 
     def _target_positions(self, n):
         """Screen positions for calibration targets. 5 = center + 4 corners; 9 = 3x3 grid; 13 = 3x3 + 4 edge midpoints."""
@@ -522,13 +989,13 @@ class GlassFrameTraining:
     def _init_tag_camera(self):
         csi_sensor = getattr(self.config, "tag_camera_csi_sensor_id", None)
         if csi_sensor is not None:
-            pipeline = _build_csi_pipeline(csi_sensor, width=1280, height=720, fps=30)
+            pipeline = _build_csi_pipeline(csi_sensor, width=1280, height=720, fps=CSI_FPS)
             cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
         else:
             cap = cv2.VideoCapture(self.config.tag_camera_id)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            cap.set(cv2.CAP_PROP_FPS, 30)
+            cap.set(cv2.CAP_PROP_FPS, CSI_FPS)
         if cap.isOpened():
             try:
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -663,37 +1130,47 @@ class GlassFrameTraining:
         return valid
 
     def _run_automated(self, tracker):
-        tag_images = self._load_tag_images()
-        missing = [tid for tid in self.config.tag_ids if tid not in tag_images]
-        if missing:
-            raise FileNotFoundError(
-                f"Missing tag images for IDs {missing} in {self.config.tag_image_dir}. "
-                "Download tags first (IDs 1-5)."
-            )
         tag_cap = self._init_tag_camera()
         if not tag_cap.isOpened():
             raise RuntimeError(f"Could not open tag camera id={self.config.tag_camera_id}.")
+        # Automated calibration uses one fullscreen target window later; discovery is back-cam only.
+        tag_order = self._resolve_tag_order_after_camera_open(tag_cap, None)
+        if not tag_order:
+            raise ValueError("No tags in calibration list after discovery.")
+        tag_images = self._load_tag_images()
+        missing = [tid for tid in tag_order if tid not in tag_images]
+        if missing:
+            raise FileNotFoundError(
+                f"Automated mode needs a PNG per tag in {self.config.tag_image_dir}. "
+                f"Missing tag36_11_*.png for IDs {missing}."
+            )
         name = "automated_calibration"
         cv2.namedWindow(name, cv2.WINDOW_NORMAL)
         cv2.setWindowProperty(name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-        num_positions = self.config.num_automated_positions
+        # One calibration round per AprilTag present (same count as tag PNGs in tag_image_dir).
+        num_positions = len(tag_order)
         positions = self._target_positions(num_positions)
         rows = []
         warmup_sec = self.config.warmup_sec
         min_conf = self.config.min_recording_conf
-        tag_ids = self.config.tag_ids
         drain = self.config.tag_camera_buffer_drain
         overlap = self.config.overlap_tag_eye_detection
+        record_every = max(1, int(self.config.record_every_n_frames))
+        group_size = max(1, int(self.config.aggregate_group_size))
+        stable_n = max(2, int(self.config.stability_window_frames))
         try:
             with ThreadPoolExecutor(max_workers=1) as tag_pool:
                 for idx in range(num_positions):
                     target_xy = positions[idx]
-                    # Cycle through configured tag images (e.g. 5 tags for 9 or 13 positions)
-                    tag_id = tag_ids[idx % len(tag_ids)]
+                    tag_id = tag_order[idx]
                     t0 = time.perf_counter()
                     recording_started = t0 + warmup_sec
+                    frame_idx = 0
+                    recent_fv4 = deque(maxlen=stable_n)
+                    group = []
                     while (time.perf_counter() - t0) < self.config.dwell_sec:
                         now = time.perf_counter()
+                        frame_idx += 1
                         ret, tag_frame = self._grab_latest_tag_frame(tag_cap, drain)
                         if not ret:
                             continue
@@ -708,80 +1185,166 @@ class GlassFrameTraining:
                             fv_conf = self._collect_feature(tracker)
                             all_dets = self._detect_tag_frame(tag_frame)
                         det = self._pick_detection(all_dets, desired_id=tag_id)
-                    display = self._render_tag_canvas(tag_images[tag_id], target_xy)
-                    if now < recording_started:
-                        cv2.putText(
-                            display,
-                            f"Get ready - recording in {max(0, int(recording_started - now))}s (target {idx + 1}/{num_positions})",
-                            (30, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.8,
-                            (0, 255, 255),
-                            2,
+                        display = self._render_tag_canvas(tag_images[tag_id], target_xy)
+                        if now < recording_started:
+                            cv2.putText(
+                                display,
+                                f"Get ready - recording in {max(0, int(recording_started - now))}s (target {idx + 1}/{num_positions})",
+                                (30, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.8,
+                                (0, 255, 255),
+                                2,
+                            )
+                        else:
+                            cv2.putText(
+                                display,
+                                f"Automated calibration: target {idx + 1}/{num_positions} - RECORDING",
+                                (30, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.8,
+                                (255, 255, 255),
+                                2,
+                            )
+                        cv2.imshow(name, display)
+                        if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                            return rows
+                        if now < recording_started or fv_conf is None or det is None:
+                            continue
+                        fv, conf = fv_conf
+                        if conf < min_conf:
+                            continue
+                        if frame_idx % record_every != 0:
+                            continue
+                        recent_fv4.append(np.asarray(fv[:4], dtype=np.float64))
+                        if not self._is_stable(recent_fv4):
+                            continue
+                        norm = tracker.get_last_left_right_pupil_normalized_crop() if hasattr(tracker, "get_last_left_right_pupil_normalized_crop") else (None, None)
+                        full = tracker.get_last_left_right_pupil_full() if hasattr(tracker, "get_last_left_right_pupil_full") else (None, None)
+                        group.append({
+                            "fv": np.asarray(fv, dtype=np.float64),
+                            "conf": float(conf),
+                            "det": det,
+                            "pupil_left_norm": norm[0] if norm else None,
+                            "pupil_right_norm": norm[1] if norm else None,
+                            "pupil_left_full": full[0] if full else None,
+                            "pupil_right_full": full[1] if full else None,
+                        })
+                        if len(group) >= group_size:
+                            row = self._aggregate_candidates_to_row(
+                                group,
+                                stage="auto_tag",
+                                screen_xy=target_xy,
+                                screen_size=(self.screen_w, self.screen_h),
+                                tag_frame_size=(tag_frame.shape[1], tag_frame.shape[0]),
+                            )
+                            if row is not None:
+                                rows.append(row)
+                            group.clear()
+                    if group:
+                        row = self._aggregate_candidates_to_row(
+                            group,
+                            stage="auto_tag",
+                            screen_xy=target_xy,
+                            screen_size=(self.screen_w, self.screen_h),
+                            tag_frame_size=(tag_frame.shape[1], tag_frame.shape[0]),
                         )
-                    else:
-                        cv2.putText(
-                            display,
-                            f"Automated calibration: target {idx + 1}/{num_positions} - RECORDING",
-                            (30, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.8,
-                            (255, 255, 255),
-                            2,
-                        )
-                    cv2.imshow(name, display)
-                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                        return rows
-                    if now < recording_started or fv_conf is None or det is None:
-                        continue
-                    fv, conf = fv_conf
-                    if conf < min_conf:
-                        continue
-                    # Record pupil coordinates and gaze for data training (from tracker)
-                    norm = tracker.get_last_left_right_pupil_normalized_crop() if hasattr(tracker, "get_last_left_right_pupil_normalized_crop") else (None, None)
-                    full = tracker.get_last_left_right_pupil_full() if hasattr(tracker, "get_last_left_right_pupil_full") else (None, None)
-                    self._last_pupil_left_norm = norm[0] if norm else None
-                    self._last_pupil_right_norm = norm[1] if norm else None
-                    self._last_pupil_left_full = full[0] if full else None
-                    self._last_pupil_right_full = full[1] if full else None
-                    row = self._make_training_row(
-                        fv=fv,
-                        conf=conf,
-                        stage="auto_tag",
-                        screen_xy=target_xy,
-                        screen_size=(self.screen_w, self.screen_h),
-                        tag_det=det,
-                        tag_frame_size=(tag_frame.shape[1], tag_frame.shape[0]),
-                    )
-                    rows.append(row)
+                        if row is not None:
+                            rows.append(row)
         finally:
             tag_cap.release()
             cv2.destroyWindow(name)
         return rows
 
     def _run_manual(self, tracker):
-        """Manual calibration: front camera = 3 windows (full + L/R crop + coords), back camera = 1 window.
-        AprilTag IDs in order 0, 1, 2, 3, ... SPACE: first = start recording for tag 0; second = pause;
-        third = move to tag 1 and record; etc. Only records when the back camera sees the current tag ID."""
+        """Manual calibration: front camera = 3 windows; back camera shows next-tag progress.
+
+        Unless ``tag_calibration_order`` is set in config, the **number of rounds** is the count of **unique
+        AprilTag IDs the back camera has seen** during the discovery step (you show the board, then SPACE).
+
+        Keys (SPACE / S only count when back-camera window is focused):
+        - SPACE: start recording current tag → pause → advance to next tag and record (same triple-press as before).
+        - S (while paused or after all tags done): checkpoint — append new rows to CSV so a later Q does not lose them.
+        - Q: quit. Rows not yet checkpointed with S are discarded (unless you finished all tags, which auto-saves).
+
+        When paused, the back view shows the **next** AprilTag to record (thumbnail + highlight if visible).
+        """
         tag_cap = self._init_tag_camera()
         if not tag_cap.isOpened():
             raise RuntimeError(
-                f"Could not open back (tag) camera. Check tag_camera_id / tag_camera_csi_sensor_id."
+                "Could not open back (tag) camera. Check tag_camera_id / tag_camera_csi_sensor_id."
             )
+        # All four OpenCV windows must exist for the whole session (including tag discovery), same as before.
         cv2.namedWindow(WIN_FRONT_FULL, cv2.WINDOW_NORMAL)
         cv2.namedWindow(WIN_FRONT_LEFT, cv2.WINDOW_NORMAL)
         cv2.namedWindow(WIN_FRONT_RIGHT, cv2.WINDOW_NORMAL)
         cv2.namedWindow(WIN_BACK, cv2.WINDOW_NORMAL)
+
+        tag_order = self._resolve_tag_order_after_camera_open(tag_cap, tracker)
+        if not tag_order:
+            tag_cap.release()
+            try:
+                cv2.destroyWindow(WIN_FRONT_FULL)
+                cv2.destroyWindow(WIN_FRONT_LEFT)
+                cv2.destroyWindow(WIN_FRONT_RIGHT)
+                cv2.destroyWindow(WIN_BACK)
+            except Exception:
+                pass
+            raise ValueError("No tags in calibration list after discovery.")
+
+        tag_images = self._load_tag_images()
+        missing = [t for t in tag_order if t not in tag_images]
+        if missing:
+            print(
+                f"[glass_frame] No tag36_11_*.png in {self.config.tag_image_dir} for IDs {missing} — "
+                "on-screen thumbnails skipped for those IDs."
+            )
+
+        print(
+            f"[glass_frame] Manual calibration: {len(tag_order)} tag(s) in order {tag_order}. "
+            "Paused view shows the next tag to look at. S while paused saves CSV checkpoint; Q without S drops unsaved rows."
+        )
+
         rows = []
-        current_tag_id = 0
+        already_disk = 0
+        committed_session = False  # True if any CSV write this run, or session finished all tags
+        checkpoint_saved = False  # True after at least one successful S checkpoint (updates Q hint)
+        tag_idx = 0
         recording = False
         just_paused = False
+        session_complete = False
+        cx, cy = 0.0, 0.0
+        current_tag_id = tag_order[0]
+
         min_conf = self.config.min_recording_conf
         drain = self.config.tag_camera_buffer_drain
         overlap = self.config.overlap_tag_eye_detection
+        record_every = max(1, int(self.config.record_every_n_frames))
+        group_size = max(1, int(self.config.aggregate_group_size))
+        stable_n = max(2, int(self.config.stability_window_frames))
+        frame_idx = 0
+        recent_fv4 = deque(maxlen=stable_n)
+        group = []
+
+        def _flush_group_to_rows():
+            nonlocal group
+            if not group:
+                return
+            row = self._aggregate_candidates_to_row(
+                group,
+                stage="manual_tag",
+                screen_xy=(cx, cy) if det_current is not None else (0.0, 0.0),
+                screen_size=(tw, th),
+                tag_frame_size=(tw, th),
+            )
+            if row is not None:
+                rows.append(row)
+            group.clear()
+
         try:
             with ThreadPoolExecutor(max_workers=1) as tag_pool:
                 while True:
+                    frame_idx += 1
                     if overlap:
                         ret, tag_frame = self._grab_latest_tag_frame(tag_cap, drain)
                         if not ret:
@@ -802,47 +1365,119 @@ class GlassFrameTraining:
                         if not ret:
                             tag_frame = None
                         all_dets = self._detect_tag_frame(tag_frame) if tag_frame is not None else []
-                    det_current = next((d for d in all_dets if d.get("tag_id") == current_tag_id), None)
-                    det_for_display = det_current if det_current is not None else (all_dets[0] if all_dets else None)
+
+                    if not session_complete and recording:
+                        current_tag_id = tag_order[tag_idx]
+                    det_current = (
+                        next((d for d in all_dets if d.get("tag_id") == current_tag_id), None)
+                        if (recording and not session_complete)
+                        else None
+                    )
+
                     self._draw_front_camera_windows(tracker)
                     preview = tag_frame.copy() if tag_frame is not None else np.zeros((480, 640, 3), dtype=np.uint8)
                     tw, th = preview.shape[1], preview.shape[0]
-                    cv2.putText(
+
+                    self._draw_manual_back_camera_ui(
                         preview,
-                        f"Current tag ID: {current_tag_id}",
-                        (20, 35),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.9,
-                        (0, 255, 255),
-                        2,
+                        tag_images,
+                        all_dets,
+                        recording=recording and not session_complete,
+                        session_complete=session_complete,
+                        just_paused=just_paused,
+                        tag_idx=tag_idx,
+                        tag_order=tag_order,
+                        checkpoint_saved=checkpoint_saved,
+                        unsaved_pending=(already_disk < len(rows)),
                     )
-                    if recording:
-                        cv2.putText(preview, "Recording - look at tag %d" % current_tag_id, (20, 70),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    else:
-                        cv2.putText(preview, "Paused", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                    cv2.putText(preview, "SPACE = start / pause / next tag    Q = quit", (20, th - 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-                    if det_for_display is not None:
-                        x, y, w, h = det_for_display["bbox"]
-                        color = (0, 255, 0) if det_for_display.get("tag_id") == current_tag_id else (128, 128, 128)
-                        cv2.rectangle(preview, (x, y), (x + w, y + h), color, 2)
-                        cv2.putText(preview, "tag_%d" % det_for_display.get("tag_id", -1), (x, max(20, y - 5)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    if recording and not session_complete and det_current is None:
+                        cv2.putText(
+                            preview,
+                            f"Tag {current_tag_id} not visible — show it to the back camera",
+                            (12, th - 68),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (0, 140, 255),
+                            2,
+                        )
+
                     cv2.imshow(WIN_BACK, preview)
                     key = cv2.waitKey(1) & 0xFF
+
                     if key == ord("q"):
+                        _flush_group_to_rows()
                         break
+
+                    if key == ord("s") and (not recording or session_complete):
+                        already_disk, n_appended = self._manual_flush_new_rows(rows, already_disk)
+                        csv_bn = os.path.basename(self.calib.current_training_data_path or "") or "training.csv"
+                        if n_appended > 0:
+                            committed_session = True
+                            checkpoint_saved = True
+                            self._set_checkpoint_banner(
+                                ok=True,
+                                line1=f"SAVED {n_appended} row(s) to disk",
+                                line2=csv_bn,
+                            )
+                        else:
+                            self._set_checkpoint_banner(
+                                ok=False,
+                                line1="NOTHING SAVED (this press)",
+                                line2="No new valid rows — buffer empty or already checkpointed.",
+                            )
+                        continue
+
+                    if key == ord(" ") and session_complete:
+                        continue
+
                     if key == ord(" "):
                         if recording:
                             recording = False
                             just_paused = True
+                            _flush_group_to_rows()
                         else:
                             if just_paused:
-                                current_tag_id += 1
-                                just_paused = False
-                            recording = True
-                    if not recording or fv_conf is None or det_current is None:
+                                tag_idx += 1
+                                if tag_idx >= len(tag_order):
+                                    session_complete = True
+                                    recording = False
+                                    just_paused = False
+                                    _flush_group_to_rows()
+                                    already_disk, n_appended = self._manual_flush_new_rows(rows, already_disk)
+                                    committed_session = True
+                                    csv_bn = os.path.basename(
+                                        self.calib.current_training_data_path or ""
+                                    ) or "training.csv"
+                                    if n_appended > 0:
+                                        checkpoint_saved = True
+                                        self._set_checkpoint_banner(
+                                            ok=True,
+                                            line1=f"SESSION COMPLETE — saved {n_appended} row(s)",
+                                            line2=csv_bn,
+                                        )
+                                    else:
+                                        self._set_checkpoint_banner(
+                                            ok=False,
+                                            line1="SESSION COMPLETE — CSV not updated",
+                                            line2="No valid rows to write; check recording quality.",
+                                        )
+                                    if n_appended > 0:
+                                        print(
+                                            "[glass_frame] Recorded all tags; "
+                                            f"wrote {n_appended} row(s) to CSV. Press Q to exit."
+                                        )
+                                    else:
+                                        print(
+                                            "[glass_frame] Recorded all tags; no valid rows written to CSV. "
+                                            "Press S while paused to retry, or Q to exit."
+                                        )
+                                else:
+                                    recording = True
+                                    just_paused = False
+                            else:
+                                recording = True
+
+                    if session_complete or not recording or fv_conf is None or det_current is None:
                         continue
                     fv, conf = fv_conf
                     if conf < min_conf:
@@ -854,29 +1489,49 @@ class GlassFrameTraining:
                         x, y, w, h = det_current["bbox"]
                         cx = x + w * 0.5
                         cy = y + h * 0.5
-                    norm = tracker.get_last_left_right_pupil_normalized_crop() if hasattr(tracker, "get_last_left_right_pupil_normalized_crop") else (None, None)
-                    full_p = tracker.get_last_left_right_pupil_full() if hasattr(tracker, "get_last_left_right_pupil_full") else (None, None)
-                    self._last_pupil_left_norm = norm[0] if norm else None
-                    self._last_pupil_right_norm = norm[1] if norm else None
-                    self._last_pupil_left_full = full_p[0] if full_p else None
-                    self._last_pupil_right_full = full_p[1] if full_p else None
-                    row = self._make_training_row(
-                        fv=fv,
-                        conf=conf,
-                        stage="manual_tag",
-                        screen_xy=(cx, cy),
-                        screen_size=(tw, th),
-                        tag_det=det_current,
-                        tag_frame_size=(tw, th),
+                    if frame_idx % record_every != 0:
+                        continue
+                    recent_fv4.append(np.asarray(fv[:4], dtype=np.float64))
+                    if not self._is_stable(recent_fv4):
+                        continue
+                    norm = (
+                        tracker.get_last_left_right_pupil_normalized_crop()
+                        if hasattr(tracker, "get_last_left_right_pupil_normalized_crop")
+                        else (None, None)
                     )
-                    rows.append(row)
+                    full_p = (
+                        tracker.get_last_left_right_pupil_full()
+                        if hasattr(tracker, "get_last_left_right_pupil_full")
+                        else (None, None)
+                    )
+                    group.append({
+                        "fv": np.asarray(fv, dtype=np.float64),
+                        "conf": float(conf),
+                        "det": det_current,
+                        "pupil_left_norm": norm[0] if norm else None,
+                        "pupil_right_norm": norm[1] if norm else None,
+                        "pupil_left_full": full_p[0] if full_p else None,
+                        "pupil_right_full": full_p[1] if full_p else None,
+                    })
+                    if len(group) >= group_size:
+                        row = self._aggregate_candidates_to_row(
+                            group,
+                            stage="manual_tag",
+                            screen_xy=(cx, cy),
+                            screen_size=(tw, th),
+                            tag_frame_size=(tw, th),
+                        )
+                        if row is not None:
+                            rows.append(row)
+                        group.clear()
         finally:
             tag_cap.release()
             cv2.destroyWindow(WIN_FRONT_FULL)
             cv2.destroyWindow(WIN_FRONT_LEFT)
             cv2.destroyWindow(WIN_FRONT_RIGHT)
             cv2.destroyWindow(WIN_BACK)
-        return rows
+
+        return committed_session
 
     def run(self):
         if not jeo_tracker_available():
@@ -890,27 +1545,79 @@ class GlassFrameTraining:
             rois_path=self._rois_path,
         )
         if not tracker.is_opened():
-            raise RuntimeError(
-                f"Could not open eye camera (camera_id={self.config.eye_camera_id}, "
-                f"sensor_id={self.config.eye_sensor_id}). For CSI on Jetson set eye_sensor_id=0 or 1."
-            )
+            # Jetson dual-CSI mapping can vary by board/cable order. Try the alternate sensor once.
+            alt_sensor = None
+            if self.config.eye_sensor_id in (0, 1):
+                alt_sensor = 1 - int(self.config.eye_sensor_id)
+            if alt_sensor is not None:
+                print(
+                    f"[glass_frame] Eye camera failed on sensor {self.config.eye_sensor_id}; "
+                    f"retrying with sensor {alt_sensor}..."
+                )
+                try:
+                    tracker.release()
+                except Exception:
+                    pass
+                tracker = JEOGlassFrameTracker(
+                    eye_camera_id=self.config.eye_camera_id,
+                    eye_sensor_id=alt_sensor,
+                    rois_path=self._rois_path,
+                )
+                if tracker.is_opened():
+                    self.config.eye_sensor_id = alt_sensor
+                    print(f"[glass_frame] Eye camera opened on fallback sensor {alt_sensor}.")
+            if not tracker.is_opened():
+                raise RuntimeError(
+                    f"Could not open eye camera (camera_id={self.config.eye_camera_id}, "
+                    f"sensor_id={self.config.eye_sensor_id}). For CSI on Jetson set eye_sensor_id=0 or 1."
+                )
         print(
             f"[glass_frame] Dual-camera tuning: overlap_tag_eye={self.config.overlap_tag_eye_detection}, "
             f"tag_buffer_drain={self.config.tag_camera_buffer_drain}, tag_quad_decimate={self.config.tag_quad_decimate}"
         )
+        fixed = self._resolve_ordered_tag_ids_from_config_only()
+        if fixed is not None:
+            self._ordered_tag_ids = tuple(fixed)
+            self.config.tag_ids = list(fixed)
+            print(
+                f"[glass_frame] Tag order from config override: {len(self._ordered_tag_ids)} tag(s) "
+                f"{list(self._ordered_tag_ids)}"
+            )
+        else:
+            self._ordered_tag_ids = None
+            print(
+                "[glass_frame] Tag list: from back camera at session start (show board; SPACE when done). "
+                "Override: set calibration.tag_ids in JSON if you cannot run discovery."
+            )
+        # Hide vendor debug windows (ellipse/rays) and keep only calibration UI windows.
+        allowed_windows = {WIN_FRONT_FULL, WIN_FRONT_LEFT, WIN_FRONT_RIGHT, WIN_BACK, "automated_calibration"}
+        _imshow_orig = cv2.imshow
+        def _imshow_filter(name, img):
+            if name in allowed_windows:
+                _imshow_orig(name, img)
+        cv2.imshow = _imshow_filter
         try:
-            if self.config.calibration_mode == "automated_calibration":
-                rows = self._run_automated(tracker)
+            if self.config.calibration_mode == "manual_calibration":
+                committed = self._run_manual(tracker)
+                if not committed:
+                    print(
+                        "[glass_frame] Quit without saving this session's new rows. "
+                        "While paused, press S to checkpoint to CSV, or finish all tags (auto-saves at end)."
+                    )
+                    return
+                print(f"[glass_frame] CSV path: {self.calib.current_training_data_path}")
+                trained = self._train_model_from_rows()
             else:
-                rows = self._run_manual(tracker)
-            rows = self._validate_rows(rows)
-            self.calib._append_training_rows(rows)
-            print(f"[glass_frame] Collected valid rows: {len(rows)}")
-            print(f"[glass_frame] CSV path: {self.calib.current_training_data_path}")
-            trained = self._train_model_from_rows()
+                rows = self._run_automated(tracker)
+                rows = self._validate_rows(rows)
+                self.calib._append_training_rows(rows)
+                print(f"[glass_frame] Collected valid rows: {len(rows)}")
+                print(f"[glass_frame] CSV path: {self.calib.current_training_data_path}")
+                trained = self._train_model_from_rows()
             if trained:
                 print("[glass_frame] Calibration/training completed.")
         finally:
+            cv2.imshow = _imshow_orig
             tracker.release()
 
 

@@ -39,7 +39,7 @@ sys.path.insert(0, JEO_3D_PATH)
 from Orlosky3DEyeTracker import process_frame
 
 # CSI pipeline (same as project's test_csi_glass_frame_pupil / eye_tracker_jetson)
-CSI_W, CSI_H, CSI_FPS = 1280, 720, 30
+CSI_W, CSI_H, CSI_FPS = 1280, 720, 60
 
 
 def build_csi_pipeline(sensor_id, width=CSI_W, height=CSI_H, fps=CSI_FPS):

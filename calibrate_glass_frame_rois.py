@@ -15,6 +15,11 @@ Usage:
 Once saved to glass_frame_rois.json (project root or cwd), the glass-frame 3D tracker loads
 these ROIs and runs pupil detection on each cropped region; pupil coordinates are converted
 to full-frame (glass-frame) coordinates.
+
+Important: JEOGlassFrameTracker mirrors the eye camera horizontally (cv2.flip(frame, 1))
+before cropping. This tool applies the same mirror before display and saving so boxes
+match calibration / test / main.py. Use the same camera mode as in tracking (CSI 1280x720
+recommended; USB 640x480 can differ in FOV/crop and look "shifted").
 """
 
 import argparse
@@ -43,7 +48,10 @@ except ImportError:
     _build_csi_pipeline = None
     CSI_W, CSI_H = 1280, 720
 
-# ROI state: (x, y, w, h) in pixels, or None
+# ROI state: (x, y, w, h) in pixels, or None — always in the same coordinate system as the
+# displayed frame (mirrored if MATCH_TRACKER_FLIP is True; see JEOGlassFrameTracker.process_frame_binocular).
+MATCH_TRACKER_FLIP = True
+
 left_roi = None
 right_roi = None
 draw_mode = None  # 'left', 'right', or None
@@ -90,11 +98,30 @@ def _mouse_callback(event, x, y, flags, param):
         start_pt = end_pt = None
 
 
+def _save_rois(out_path, h, w):
+    data = {}
+    if left_roi is not None:
+        data["left_eye_roi"] = _normalize_roi(left_roi, h, w)
+    if right_roi is not None:
+        data["right_eye_roi"] = _normalize_roi(right_roi, h, w)
+    if data:
+        with open(out_path, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"Saved to {out_path}")
+    else:
+        print("Draw at least one ROI (1 or 2) before saving.")
+
+
 def main():
     global frame_size, left_roi, right_roi, draw_mode
     parser = argparse.ArgumentParser(description="Define left/right eye regions for glass-frame (custom landmarks).")
     parser.add_argument("--sensor-id", type=int, default=0, help="CSI sensor (0 = default for single camera; 1 for second). Ignored if using USB.")
     parser.add_argument("--output", type=str, default=None, help="Output JSON path (default: glass_frame_rois.json in cwd)")
+    parser.add_argument(
+        "--no-flip",
+        action="store_true",
+        help="Do not mirror the preview (only for debugging). Tracker still flips at runtime — ROIs will not match.",
+    )
     args = parser.parse_args()
 
     cap = None
@@ -133,6 +160,9 @@ def main():
         print("Failed to read first frame.")
         cap.release()
         return 1
+    use_flip = MATCH_TRACKER_FLIP and not args.no_flip
+    if use_flip:
+        frame = cv2.flip(frame, 1)
     frame_size = (frame.shape[0], frame.shape[1])
     h, w = frame_size
 
@@ -144,120 +174,56 @@ def main():
 
     print("Draw LEFT eye: press '1' then click-and-drag. Draw RIGHT eye: press '2' then click-and-drag.")
     print("Save: 's'. Reset: 'r'. Quit: 'q'.")
+    if use_flip:
+        print("Preview is mirrored horizontally (same as eye tracker) — draw ROIs on this view.")
+    print(f"Frame size: {w}x{h} — use the same camera/resolution as in calibration for aligned ROIs.")
 
-    try:
-        import gi
-        gi.require_version("GLib", "2.0")
-        from gi.repository import GLib
-        main_loop_ref = [None]
-        def tick():
-            global draw_mode, left_roi, right_roi
-            ret, frame = cap.read()
-            if not ret:
-                return True
-            disp = frame.copy()
-            # Draw saved ROIs with thick lines and clear labels
-            if left_roi is not None:
-                x, y, rw, rh = left_roi
-                cv2.rectangle(disp, (x, y), (x + rw, y + rh), (0, 255, 0), 4)
-                cv2.putText(disp, "LEFT eye ROI", (x, max(24, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            if right_roi is not None:
-                x, y, rw, rh = right_roi
-                cv2.rectangle(disp, (x, y), (x + rw, y + rh), (255, 0, 0), 4)
-                cv2.putText(disp, "RIGHT eye ROI", (x, max(24, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-            if draw_mode and start_pt is not None and end_pt is not None:
-                cv2.rectangle(disp, start_pt, end_pt, (0, 255, 255), 4)
-            mode_str = f" [drawing: {draw_mode}]" if draw_mode else ""
-            cv2.putText(disp, f"1=left 2=right s=save r=reset q=quit{mode_str}", (10, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            # Status: what you have drawn
-            status = []
-            if left_roi is not None:
-                status.append("Left: drawn")
-            if right_roi is not None:
-                status.append("Right: drawn")
-            if status:
-                cv2.putText(disp, " | ".join(status), (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.imshow(win, disp)
-            k = cv2.waitKey(1) & 0xFF
-            if k == ord("q"):
-                if main_loop_ref[0]:
-                    main_loop_ref[0].quit()
-                return False
-            if k == ord("1"):
-                draw_mode = "left"
-            if k == ord("2"):
-                draw_mode = "right"
-            if k == ord("r"):
-                left_roi = right_roi = None
-                draw_mode = None
-            if k == ord("s"):
-                data = {}
-                if left_roi is not None:
-                    data["left_eye_roi"] = _normalize_roi(left_roi, h, w)
-                if right_roi is not None:
-                    data["right_eye_roi"] = _normalize_roi(right_roi, h, w)
-                if data:
-                    with open(out_path, "w") as f:
-                        json.dump(data, f, indent=2)
-                    print(f"Saved to {out_path}")
-                else:
-                    print("Draw at least one ROI (1 or 2) before saving.")
-            return True
-        GLib.timeout_add(33, tick)
-        loop = GLib.MainLoop()
-        main_loop_ref[0] = loop
-        loop.run()
-    except ImportError:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            disp = frame.copy()
-            h, w = disp.shape[:2]
-            if left_roi is not None:
-                x, y, rw, rh = left_roi
-                cv2.rectangle(disp, (x, y), (x + rw, y + rh), (0, 255, 0), 4)
-                cv2.putText(disp, "LEFT eye ROI", (x, max(24, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            if right_roi is not None:
-                x, y, rw, rh = right_roi
-                cv2.rectangle(disp, (x, y), (x + rw, y + rh), (255, 0, 0), 4)
-                cv2.putText(disp, "RIGHT eye ROI", (x, max(24, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-            if draw_mode and start_pt is not None and end_pt is not None:
-                cv2.rectangle(disp, start_pt, end_pt, (0, 255, 255), 4)
-            mode_str = f" [drawing: {draw_mode}]" if draw_mode else ""
-            cv2.putText(disp, f"1=left 2=right s=save r=reset q=quit{mode_str}", (10, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            status = []
-            if left_roi is not None:
-                status.append("Left: drawn")
-            if right_roi is not None:
-                status.append("Right: drawn")
-            if status:
-                cv2.putText(disp, " | ".join(status), (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.imshow(win, disp)
-            k = cv2.waitKey(30) & 0xFF
-            if k == ord("q"):
-                break
-            if k == ord("1"):
-                draw_mode = "left"
-            if k == ord("2"):
-                draw_mode = "right"
-            if k == ord("r"):
-                left_roi = right_roi = None
-                draw_mode = None
-            if k == ord("s"):
-                data = {}
-                if left_roi is not None:
-                    data["left_eye_roi"] = _normalize_roi(left_roi, h, w)
-                if right_roi is not None:
-                    data["right_eye_roi"] = _normalize_roi(right_roi, h, w)
-                if data:
-                    with open(out_path, "w") as f:
-                        json.dump(data, f, indent=2)
-                    print(f"Saved to {out_path}")
-                else:
-                    print("Draw at least one ROI (1 or 2) before saving.")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if use_flip:
+            frame = cv2.flip(frame, 1)
+        disp = frame.copy()
+        h, w = disp.shape[:2]
+        if left_roi is not None:
+            x, y, rw, rh = left_roi
+            cv2.rectangle(disp, (x, y), (x + rw, y + rh), (0, 255, 0), 4)
+            cv2.putText(disp, "LEFT eye ROI", (x, max(24, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        if right_roi is not None:
+            x, y, rw, rh = right_roi
+            cv2.rectangle(disp, (x, y), (x + rw, y + rh), (255, 0, 0), 4)
+            cv2.putText(disp, "RIGHT eye ROI", (x, max(24, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+        if draw_mode and start_pt is not None and end_pt is not None:
+            cv2.rectangle(disp, start_pt, end_pt, (0, 255, 255), 4)
+        mode_str = f" [drawing: {draw_mode}]" if draw_mode else ""
+        cv2.putText(disp, f"1=left 2=right s=save r=reset q=quit{mode_str}", (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        status = []
+        if left_roi is not None:
+            status.append("Left: drawn")
+        if right_roi is not None:
+            status.append("Right: drawn")
+        if status:
+            cv2.putText(disp, " | ".join(status), (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.imshow(win, disp)
+
+        # waitKeyEx has better key behavior across backends; normalize to lowercase ASCII.
+        k = cv2.waitKeyEx(1)
+        if k < 0:
+            continue
+        key = chr(k & 0xFF).lower()
+        if key == "q":
+            break
+        if key == "1":
+            draw_mode = "left"
+        if key == "2":
+            draw_mode = "right"
+        if key == "r":
+            left_roi = right_roi = None
+            draw_mode = None
+        if key == "s":
+            _save_rois(out_path, h, w)
 
     cap.release()
     cv2.destroyAllWindows()

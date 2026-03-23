@@ -18,6 +18,7 @@ Use this checklist so calibration is reproducible and you get **good, less noisy
 
 - [ ] Copy `calibration_config.json.example` to `calibration_config.json`.
 - [ ] Set `camera` (sensor IDs, camera IDs), `calibration` (mode, validation_fraction, outlier_mad_multiplier, num_automated_positions), and `cursor_smoothing` (min_cutoff, beta, gaze_jump_thresh) as needed. This makes every run reproducible.
+- [ ] Jetson smooth/noise defaults: keep `record_every_n_frames=2`, `stability_window_frames=5`, `stability_std_threshold=0.025`, `aggregate_group_size=4` to reduce noisy rows while keeping enough training data.
 
 ---
 

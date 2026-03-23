@@ -29,6 +29,8 @@ class HoverAppConfig:
         gaze_smooth_min_cutoff=None,  # OneEuro: lower = smoother, less jitter (e.g. 1.0)
         gaze_smooth_beta=None,
         gaze_jump_thresh=None,  # reject gaze jump above this (e.g. 0.06)
+        window_name=None,  # OpenCV window title; default set in HoverApp
+        gaze_inference_mode="auto",  # auto | poly_ridge | binocular_ridge | ensemble | affine (see gaze_inference.py)
     ):
         self.source_type = source_type
         self.image_path = image_path
@@ -51,12 +53,14 @@ class HoverAppConfig:
         self.gaze_smooth_min_cutoff = gaze_smooth_min_cutoff
         self.gaze_smooth_beta = gaze_smooth_beta
         self.gaze_jump_thresh = gaze_jump_thresh
+        self.window_name = window_name
+        self.gaze_inference_mode = gaze_inference_mode or "auto"
 
 
 class HoverApp:
     def __init__(self, config):
         self.config = config
-        self.window_name = "object_hover"
+        self.window_name = config.window_name or "eye_tracking"
         self.screen_w = None
         self.screen_h = None
         if config.source_type == "camera":
@@ -100,6 +104,7 @@ class HoverApp:
                 kwargs["beta"] = config.gaze_smooth_beta
             if getattr(config, "gaze_jump_thresh", None) is not None:
                 kwargs["gaze_jump_thresh"] = config.gaze_jump_thresh
+            kwargs["inference_mode"] = getattr(config, "gaze_inference_mode", "auto")
             self.cursor = EyeTrackerCursor(config.eye_tracker, config.calibration, **kwargs)
             self.cursor_space = "screen"
             self.screen_w = int(config.calibration.screen_w)
@@ -246,6 +251,12 @@ class HoverApp:
                 _, _, win_w, win_h = win_rect
             else:
                 win_w, win_h = frame_w, frame_h
+            if self.config.cursor_type == "eye_tracking" and self.config.detector_type == "apriltag":
+                bar = "Eye tracking: gaze cursor on back camera | look at a tag to select | Q=quit"
+                cv2.rectangle(frame, (0, 0), (frame_w, 36), (0, 0, 0), -1)
+                cv2.putText(
+                    frame, bar, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (220, 220, 255), 1
+                )
             disp = self._compute_display_rect(frame_w, frame_h, win_w, win_h)
             if disp is None or (win_w == frame_w and win_h == frame_h):
                 display = frame

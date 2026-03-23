@@ -15,7 +15,12 @@
     "min_train_samples": 10,
     "tag_camera_buffer_drain": 2,
     "overlap_tag_eye_detection": true,
-    "tag_quad_decimate": 1.0
+    "tag_quad_decimate": 1.0,
+    "tag_detect_scale": 1.0,
+    "record_every_n_frames": 2,
+    "stability_window_frames": 5,
+    "stability_std_threshold": 0.025,
+    "aggregate_group_size": 4
   },
   "cursor_smoothing": {
     "min_cutoff": 1.0,

@@ -1,7 +1,9 @@
 import cv2
 
+from ..glass_frame_jeo_tracker import CSI_FPS
 
-def _csi_pipeline(sensor_id: int, width: int = 1280, height: int = 720, fps: int = 30) -> str:
+
+def _csi_pipeline(sensor_id: int, width: int = 1280, height: int = 720, fps: int = CSI_FPS) -> str:
     """GStreamer pipeline for Jetson CSI (e.g. cam0 = sensor 0, 24-pin)."""
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} ! "
@@ -21,7 +23,7 @@ class InputSource:
 
 
 class CameraSource(InputSource):
-    def __init__(self, camera_id=0, width=1280, height=720, fps=30, csi_sensor_id=None):
+    def __init__(self, camera_id=0, width=1280, height=720, fps=CSI_FPS, csi_sensor_id=None):
         if csi_sensor_id is not None:
             pipeline = _csi_pipeline(csi_sensor_id, width=width, height=height, fps=fps)
             self.cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)

@@ -1,6 +1,7 @@
 import time
 import os
 from ..calibration import OneEuroFilter2D
+from .gaze_inference import predict_gaze_screen_xy, valid_inference_modes
 
 try:
     import pyautogui
@@ -44,9 +45,22 @@ class EyeTrackerCursor(CursorSource):
 
     STATS_INTERVAL = 200
 
-    def __init__(self, tracker, calibration, min_cutoff=1.2, beta=0.12, gaze_jump_thresh=0.08):
+    def __init__(
+        self,
+        tracker,
+        calibration,
+        min_cutoff=1.2,
+        beta=0.12,
+        gaze_jump_thresh=0.08,
+        inference_mode="auto",
+    ):
         self.tracker = tracker
         self.calibration = calibration
+        im = (inference_mode or "auto").strip().lower().replace("-", "_")
+        if im not in valid_inference_modes():
+            print(f"[cursor] Unknown gaze_inference mode '{inference_mode}', using auto.")
+            im = "auto"
+        self.inference_mode = im
         # Configurable smoothing: lower min_cutoff = smoother (less jitter), higher beta = less lag
         self._gaze_filter = OneEuroFilter2D(min_cutoff=float(min_cutoff), beta=float(beta), d_cutoff=1.0)
         self._last_gaze_before_filter = None  # for jump rejection before OneEuro
@@ -62,7 +76,7 @@ class EyeTrackerCursor(CursorSource):
             self._log_file.write("# t gx gy eye_w lid_h blink\n")
         except Exception:
             self._log_file = None
-        self._stats = {"ml": 0, "binoc": 0, "fallback": 0, "drop": 0}
+        self._stats = {"ml": 0, "binoc": 0, "ensemble": 0, "fallback": 0, "drop": 0}
         self._frame_count = 0
         self._last_good = {"t": 0.0, "xy": None}
         self._fv_dim_mismatch_logged = False
@@ -139,57 +153,34 @@ class EyeTrackerCursor(CursorSource):
             now = time.perf_counter()
             gx, gy = self._gaze_filter(gx, gy, t=now)
 
-            used_ml = False
-            used_binoc = False
-            screen_pt = None
-            ml = getattr(self.calibration, "ml", None)
-            input_dim = getattr(ml, "input_dim", None) if ml is not None else None
-            fv_dim_ok = (fv is not None and input_dim is not None and len(fv) == input_dim)
-            if fv is not None and input_dim is not None and len(fv) != input_dim and not getattr(self, "_fv_dim_mismatch_logged", False):
-                print(f"[cursor] ML skipped: fv len={len(fv)} != ml.input_dim={input_dim}. Fall back; retrain with current fv.")
-                self._fv_dim_mismatch_logged = True
-            fv_in = (fv[:input_dim] if fv_dim_ok and fv is not None else None)
-            if fv_dim_ok and ml is not None and getattr(ml, "W", None) is not None and fv_in is not None:
-                screen_pt = self.calibration.ml.predict(fv_in)
-                if screen_pt is not None:
-                    if not (0.0 <= screen_pt[0] <= 1.0 and 0.0 <= screen_pt[1] <= 1.0):
-                        screen_pt = None
-                    else:
-                        screen_pt = (
-                            screen_pt[0] * self.calibration.screen_w,
-                            screen_pt[1] * self.calibration.screen_h,
-                        )
-                        used_ml = True
-                        self._last_good["t"] = now
-                        self._last_good["xy"] = screen_pt
-            if not used_ml and fv is not None and len(fv) >= 14 and getattr(self.calibration, "binoc_W", None) is not None:
-                screen_pt = self.calibration.map_binocular(fv)
-                if screen_pt is not None:
-                    if not (0.0 <= screen_pt[0] <= 1.0 and 0.0 <= screen_pt[1] <= 1.0):
-                        screen_pt = None
-                    else:
-                        screen_pt = (
-                            screen_pt[0] * self.calibration.screen_w,
-                            screen_pt[1] * self.calibration.screen_h,
-                        )
-                        used_binoc = True
-                        self._last_good["t"] = now
-                        self._last_good["xy"] = screen_pt
-            if screen_pt is None:
-                screen_pt = self.calibration.gaze_to_screen(gx, gy, yaw=yaw, pitch=pitch, feature_vec=fv)
-            if screen_pt is None:
-                screen_pt = self.calibration.gaze_to_screen(gx, gy, yaw=yaw, pitch=pitch, feature_vec=fv)
+            if fv is not None and getattr(self.calibration, "ml", None) is not None:
+                input_dim = getattr(self.calibration.ml, "input_dim", None)
+                if input_dim is not None and len(fv) != input_dim and not getattr(self, "_fv_dim_mismatch_logged", False):
+                    print(
+                        f"[cursor] ML skipped: fv len={len(fv)} != ml.input_dim={input_dim}. "
+                        "Fall back; retrain with current fv."
+                    )
+                    self._fv_dim_mismatch_logged = True
+
+            screen_pt, src = predict_gaze_screen_xy(
+                self.calibration, fv, gx, gy, yaw, pitch, mode=self.inference_mode
+            )
             if screen_pt is None and self._last_good["xy"] is not None and (now - self._last_good["t"]) < 0.15:
                 screen_pt = self._last_good["xy"]
+                src = None
             if screen_pt is None:
                 self._stats["drop"] += 1
                 self._maybe_print_stats()
                 return None
+            self._last_good["t"] = now
+            self._last_good["xy"] = screen_pt
             self._last_gaze_before_filter = gaze_before_filter
-            if used_ml:
+            if src == "poly_ridge":
                 self._stats["ml"] += 1
-            elif used_binoc:
+            elif src == "binocular_ridge":
                 self._stats["binoc"] += 1
+            elif src == "ensemble":
+                self._stats["ensemble"] += 1
             else:
                 self._stats["fallback"] += 1
             self._maybe_print_stats()
@@ -202,16 +193,23 @@ class EyeTrackerCursor(CursorSource):
     def _maybe_print_stats(self):
         if self._frame_count % self.STATS_INTERVAL != 0:
             return
-        total = self._stats["ml"] + self._stats["binoc"] + self._stats["fallback"] + self._stats["drop"]
+        total = (
+            self._stats["ml"]
+            + self._stats["binoc"]
+            + self._stats["ensemble"]
+            + self._stats["fallback"]
+            + self._stats["drop"]
+        )
         if total == 0:
             return
         ml_pct = 100.0 * self._stats["ml"] / total
         binoc_pct = 100.0 * self._stats["binoc"] / total
+        ens_pct = 100.0 * self._stats["ensemble"] / total
         fallback_pct = 100.0 * self._stats["fallback"] / total
         drop_pct = 100.0 * self._stats["drop"] / total
         print(
-            f"[cursor] ML={ml_pct:.1f}% binoc={binoc_pct:.1f}% fallback={fallback_pct:.1f}% drop={drop_pct:.1f}% "
-            f"(n={total})"
+            f"[cursor] poly_ridge={ml_pct:.1f}% binoc_ridge={binoc_pct:.1f}% ensemble={ens_pct:.1f}% "
+            f"affine={fallback_pct:.1f}% drop={drop_pct:.1f}% (n={total}) mode={self.inference_mode}"
         )
 
     def release(self):
@@ -223,7 +221,9 @@ class EyeTrackerCursor(CursorSource):
             except Exception:
                 pass
         try:
-            if getattr(self.tracker, "cap", None) is not None:
+            if hasattr(self.tracker, "release"):
+                self.tracker.release()
+            elif getattr(self.tracker, "cap", None) is not None:
                 self.tracker.cap.release()
         except Exception:
             pass

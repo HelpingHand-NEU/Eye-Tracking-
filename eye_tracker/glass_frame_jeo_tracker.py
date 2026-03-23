@@ -34,7 +34,8 @@ except ImportError:
 # 16-D feature vector order (must match Calibration.FEATURE_COLUMNS)
 FEATURE_DIM = 16
 GazeVectorPathDefault = "gaze_vector.txt"
-CSI_W, CSI_H, CSI_FPS = 1280, 720, 30
+# IMX219 commonly exposes 1280x720 @ ~60 fps (Argus mode 4). Use 60 for smoother capture; lower if unstable.
+CSI_W, CSI_H, CSI_FPS = 1280, 720, 60
 # ROI crop is resized to this before passing to JEO (vendor expects ~640x480)
 JEO_CROP_W, JEO_CROP_H = 640, 480
 GLASS_FRAME_ROIS_FILENAME = "glass_frame_rois.json"
